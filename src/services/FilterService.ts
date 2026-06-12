@@ -1,0 +1,827 @@
+import {
+	FilterQuery,
+	TaskInfo,
+	TaskSortKey,
+	SortDirection,
+	FilterCondition,
+	FilterGroup,
+	FilterOptions,
+} from "../types";
+import { TFile, type App } from "obsidian";
+import { parseLinkToPath } from "../utils/linkUtils";
+import { TaskManager } from "../utils/TaskManager";
+import { StatusManager } from "./StatusManager";
+import { PriorityManager } from "./PriorityManager";
+import { EventEmitter } from "../utils/EventEmitter";
+import { FilterUtils, FilterValidationError, FilterEvaluationError } from "../utils/FilterUtils";
+import { format } from "date-fns";
+import { isToday as isTodayUtil, formatDateForStorage, isTodayUTC } from "../utils/dateUtils";
+import { TranslationKey } from "../i18n";
+import { FilterQueryPlanner } from "./filter-service/FilterQueryPlanner";
+import {
+	findUserFieldByIdOrKey,
+	getHierarchicalUserFieldGroupValues,
+} from "./filter-service/userFieldValues";
+import { isTaskForAgendaDate, isTaskOverdueForAgenda } from "./filter-service/agendaTaskSelection";
+import {
+	evaluateFilterNode,
+	type FilterPredicateEvaluationContext,
+} from "./filter-service/filterPredicateEvaluation";
+import {
+	groupFilterTasks,
+	type FilterTaskGroupingContext,
+} from "./filter-service/filterTaskGrouping";
+import { sortFilterTasks, type FilterTaskSortingContext } from "./filter-service/filterTaskSorting";
+import { buildFilterOptions } from "./filter-service/filterOptions";
+import {
+	applyQuickToggleCondition,
+	createDefaultFilterQuery,
+	normalizeFilterQuery,
+	type QuickFilterToggle,
+} from "./filter-service/filterQueryState";
+import type { TaskNotesSettings } from "../types/settings";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/FilterService" });
+
+type FilterServiceSettings = Pick<TaskNotesSettings, "userFields" | "hideCompletedFromOverdue">;
+
+interface FilterServiceI18n {
+	translate(key: TranslationKey, vars?: Record<string, string | number>): string;
+	getCurrentLocale?(): string;
+}
+
+interface FilterServiceProjectSubtasks {
+	isTaskUsedAsProjectSync(path: string): boolean;
+}
+
+export interface FilterServiceRuntime {
+	app?: App;
+	settings?: Partial<FilterServiceSettings>;
+	i18n?: FilterServiceI18n;
+	projectSubtasksService?: FilterServiceProjectSubtasks;
+}
+
+/**
+ * Unified filtering, sorting, and grouping service for all task views.
+ * Provides performance-optimized data retrieval using CacheManager indexes.
+ */
+export class FilterService extends EventEmitter {
+	private static lastInstance: FilterService | null = null;
+	private cacheManager: TaskManager;
+	private statusManager: StatusManager;
+	private priorityManager: PriorityManager;
+
+	private readonly queryPlanner: FilterQueryPlanner;
+
+	// Filter options caching for better performance
+	private filterOptionsCache: FilterOptions | null = null;
+	private filterOptionsCacheTimestamp = 0;
+	private filterOptionsCacheTTL = 300000; // 5 minutes fallback TTL (should rarely be needed)
+	private filterOptionsComputeCount = 0;
+	private filterOptionsCacheHits = 0;
+
+	private currentSortKey?: TaskSortKey;
+	private currentSortDirection?: SortDirection;
+	constructor(
+		cacheManager: TaskManager,
+		statusManager: StatusManager,
+		priorityManager: PriorityManager,
+		private runtime?: FilterServiceRuntime | null
+	) {
+		super();
+		this.cacheManager = cacheManager;
+		this.statusManager = statusManager;
+		this.priorityManager = priorityManager;
+		this.queryPlanner = new FilterQueryPlanner({
+			cacheManager,
+			timer: {
+				setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+				clearTimeout: (timeoutId) => window.clearTimeout(timeoutId),
+			},
+		});
+		FilterService.lastInstance = this;
+	}
+
+	private translate(
+		key: TranslationKey,
+		fallback: string,
+		vars?: Record<string, string | number>
+	): string {
+		try {
+			if (this.runtime?.i18n) {
+				return this.runtime.i18n.translate(key, vars);
+			}
+		} catch (error) {
+			tasknotesLogger.error("FilterService translation error:", {
+				category: "internal",
+				operation: "filterservice-translation",
+				error: error,
+			});
+		}
+		return fallback;
+	}
+
+	private static translateStatic(key: TranslationKey, fallback: string): string {
+		const instance = FilterService.lastInstance;
+		if (instance) {
+			return instance.translate(key, fallback);
+		}
+		return fallback;
+	}
+
+	private getLocale(): string {
+		try {
+			const locale = this.runtime?.i18n?.getCurrentLocale?.();
+			if (locale) {
+				return locale;
+			}
+		} catch (error) {
+			tasknotesLogger.error("FilterService locale error:", {
+				category: "internal",
+				operation: "filterservice-locale",
+				error: error,
+			});
+		}
+		return "en";
+	}
+
+	private getNoProjectLabel(): string {
+		return this.translate("services.filter.groupLabels.noProject", "No project");
+	}
+
+	/**
+	 * Main method to get filtered, sorted, and grouped tasks
+	 * Handles the new advanced FilterQuery structure with nested conditions and groups
+	 * Uses query-first approach with index optimization for better performance
+	 */
+	async getGroupedTasks(query: FilterQuery, targetDate?: Date): Promise<Map<string, TaskInfo[]>> {
+		try {
+			// Use non-strict validation to allow incomplete filters during building
+			FilterUtils.validateFilterNode(query, false);
+
+			// PHASE 1 OPTIMIZATION: Use query-first approach with index-backed filtering
+			let candidateTaskPaths = this.queryPlanner.getIndexOptimizedTaskPaths(query);
+
+			// Convert paths to TaskInfo objects (only for candidates)
+			const candidateTasks = await this.pathsToTaskInfos(Array.from(candidateTaskPaths));
+
+			// Apply full filter query to the reduced candidate set
+			const filteredTasks = candidateTasks.filter((task) =>
+				this.evaluateFilterNode(query, task, targetDate)
+			);
+
+			// Sort the filtered results (flat sort)
+			const sortedTasks = this.sortTasks(
+				filteredTasks,
+				query.sortKey || "due",
+				query.sortDirection || "asc"
+			);
+
+			// Expose current sort to group ordering logic (used when groupKey === sortKey)
+			this.currentSortKey = query.sortKey || "due";
+			this.currentSortDirection = query.sortDirection || "asc";
+
+			// Group the results; group order handled inside sortGroups
+			return groupFilterTasks(
+				sortedTasks,
+				query.groupKey || "none",
+				this.createTaskGroupingContext(),
+				targetDate
+			);
+		} catch (error) {
+			if (error instanceof FilterValidationError || error instanceof FilterEvaluationError) {
+				tasknotesLogger.error("Filter error:", {
+					category: "internal",
+					operation: "filter",
+					details: {
+						values: [
+							error.message,
+							{ nodeId: error.nodeId, field: (error as FilterValidationError).field },
+						],
+					},
+				});
+				// Return empty results rather than throwing - let UI handle gracefully
+				return new Map<string, TaskInfo[]>();
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Additive API: returns standard groups and optional hierarchicalGroups when subgroupKey is set
+	 */
+	async getHierarchicalGroupedTasks(
+		query: FilterQuery,
+		targetDate?: Date
+	): Promise<{
+		groups: Map<string, TaskInfo[]>;
+		hierarchicalGroups?: Map<string, Map<string, TaskInfo[]>>;
+	}> {
+		try {
+			// Allow incomplete filters while building
+			FilterUtils.validateFilterNode(query, false);
+
+			// Reuse the same pipeline as getGroupedTasks to avoid behavior drift
+			let candidateTaskPaths = this.queryPlanner.getIndexOptimizedTaskPaths(query);
+			const candidateTasks = await this.pathsToTaskInfos(Array.from(candidateTaskPaths));
+			const filteredTasks = candidateTasks.filter((task) =>
+				this.evaluateFilterNode(query, task, targetDate)
+			);
+
+			const sortedTasks = this.sortTasks(
+				filteredTasks,
+				query.sortKey || "due",
+				query.sortDirection || "asc"
+			);
+
+			// Preserve current sort for group ordering
+			this.currentSortKey = query.sortKey || "due";
+			this.currentSortDirection = query.sortDirection || "asc";
+
+			const groups = groupFilterTasks(
+				sortedTasks,
+				query.groupKey || "none",
+				this.createTaskGroupingContext(),
+				targetDate
+			);
+
+			// Compute hierarchical grouping only when both keys are active
+			const subgroupKey = query.subgroupKey;
+			if (
+				subgroupKey &&
+				subgroupKey !== "none" &&
+				query.groupKey &&
+				query.groupKey !== "none"
+			) {
+				// Lazy import to avoid circular deps at module load
+				const { HierarchicalGroupingService } = await import(
+					"./HierarchicalGroupingService"
+				);
+
+				// Resolver that mirrors user-field extraction logic used elsewhere in this service
+				const resolver = (task: TaskInfo, fieldIdOrKey: string): string[] => {
+					const userFields = this.runtime?.settings?.userFields || [];
+					const field = findUserFieldByIdOrKey(userFields, fieldIdOrKey);
+					const missingLabel = `No ${field?.displayName || field?.key || fieldIdOrKey}`;
+					const raw = field ? this.getUserFieldRawValue(task, field.key) : undefined;
+					return getHierarchicalUserFieldGroupValues(field, raw, missingLabel);
+				};
+
+				const svc = new HierarchicalGroupingService(resolver);
+				const hierarchicalGroups = svc.group(
+					sortedTasks,
+					query.groupKey,
+					subgroupKey,
+					this.currentSortDirection,
+					this.runtime?.settings?.userFields || []
+				);
+
+				// Ensure primary group order matches the same order used for flat groups
+				// (e.g., status order) instead of insertion order influenced by the current task sort.
+				const orderedPrimaryKeys = Array.from(groups.keys()); // already sorted via sortGroups()
+				const orderedHierarchical = new Map<string, Map<string, TaskInfo[]>>();
+				for (const key of orderedPrimaryKeys) {
+					const sub = hierarchicalGroups.get(key);
+					if (sub) orderedHierarchical.set(key, sub);
+				}
+				// Safety: include any primaries that might exist only in hierarchicalGroups
+				for (const [key, sub] of hierarchicalGroups) {
+					if (!orderedHierarchical.has(key)) orderedHierarchical.set(key, sub);
+				}
+
+				return { groups, hierarchicalGroups: orderedHierarchical };
+			}
+
+			return { groups };
+		} catch (error) {
+			if (error instanceof FilterValidationError || error instanceof FilterEvaluationError) {
+				tasknotesLogger.error("Filter error (hierarchical):", {
+					category: "internal",
+					operation: "filter-hierarchical",
+					details: { values: [error.message, { nodeId: error.nodeId }] },
+				});
+				return { groups: new Map<string, TaskInfo[]>() };
+			}
+			throw error;
+		}
+	}
+
+	getCacheStats(): { entryCount: number; cacheKeys: string[]; timeoutMs: number } {
+		return this.queryPlanner.getCacheStats();
+	}
+
+	/**
+	 * Convert task paths to TaskInfo objects
+	 */
+	private async pathsToTaskInfos(paths: string[]): Promise<TaskInfo[]> {
+		const tasks: TaskInfo[] = [];
+		const batchSize = 50;
+
+		for (let i = 0; i < paths.length; i += batchSize) {
+			const batch = paths.slice(i, i + batchSize);
+			const batchTasks = await Promise.all(
+				batch.map((path) => this.cacheManager.getCachedTaskInfo(path))
+			);
+
+			for (const task of batchTasks) {
+				if (task) {
+					tasks.push(task);
+				}
+			}
+		}
+
+		return tasks;
+	}
+
+	/**
+	 * Recursively evaluate a filter node (group or condition) against a task
+	 * Returns true if the task matches the filter criteria
+	 */
+	private evaluateFilterNode(
+		node: FilterGroup | FilterCondition,
+		task: TaskInfo,
+		targetDate?: Date
+	): boolean {
+		return evaluateFilterNode(node, task, this.createPredicateEvaluationContext(), targetDate);
+	}
+
+	private createPredicateEvaluationContext(): FilterPredicateEvaluationContext {
+		return {
+			app: this.runtime?.app,
+			userFields: this.runtime?.settings?.userFields || [],
+			projectSubtasksService: this.runtime?.projectSubtasksService,
+			getUserFieldRawValue: (task, fieldKey) => this.getUserFieldRawValue(task, fieldKey),
+			getCompletedStatuses: () => this.statusManager.getCompletedStatuses(),
+			isCompletedStatus: (status) => this.statusManager.isCompletedStatus(status),
+		};
+	}
+
+	/**
+	 * Resolve project reference to absolute file path for consistent grouping.
+	 * Returns the absolute path if it resolves to a file, otherwise returns the original value.
+	 * Supports wikilinks ([[path]]), markdown links ([text](path)), and plain paths.
+	 */
+	resolveProjectToAbsolutePath(projectValue: string): string {
+		if (!projectValue || typeof projectValue !== "string") {
+			return projectValue || "";
+		}
+
+		if (!this.runtime?.app) {
+			return projectValue;
+		}
+
+		// Parse link formats (wikilinks and markdown links) to extract path
+		// This handles [[path]], [[path|alias]], and [text](path) formats
+		const linkPath = this.parseLinkToPath(projectValue);
+
+		// Always try to resolve using Obsidian's API - this handles relative paths correctly
+		const resolvedFile = this.runtime.app.metadataCache.getFirstLinkpathDest(linkPath, "");
+		if (resolvedFile) {
+			// Return the absolute file path (vault-relative) without .md extension
+			return resolvedFile.path.replace(/\.md$/, "");
+		}
+
+		// If file doesn't exist, return the link path
+		return linkPath.replace(/\.md$/, "");
+	}
+
+	/**
+	 * Parse a link string (wikilink or markdown) to extract the path.
+	 * Handles [[wikilink]], [[path|alias]], and [text](path) formats.
+	 * For non-link strings, returns the input as-is.
+	 */
+	private parseLinkToPath(linkText: string): string {
+		return parseLinkToPath(linkText);
+	}
+
+	/**
+	 * Get the preferred project format for writing to task frontmatter.
+	 * Converts an absolute path back to a proper wikilink format.
+	 */
+	getPreferredProjectFormat(absolutePathOrName: string): string {
+		const noProjectLabel = this.getNoProjectLabel();
+		if (!absolutePathOrName || absolutePathOrName === noProjectLabel) {
+			return absolutePathOrName;
+		}
+
+		// If it's already an absolute path, return as wikilink
+		if (absolutePathOrName.includes("/") || absolutePathOrName.endsWith(".md")) {
+			return `[[${absolutePathOrName}]]`;
+		}
+
+		// For non-path values (plain text projects), return as simple wikilink
+		return `[[${absolutePathOrName}]]`;
+	}
+
+	/**
+	 * Get overdue task paths efficiently using the dedicated index
+	 */
+	getOverdueTaskPaths(): Set<string> {
+		return this.cacheManager.getOverdueTaskPaths();
+	}
+
+	/**
+	 * Sort tasks by specified criteria
+	 */
+	private sortTasks(
+		tasks: TaskInfo[],
+		sortKey: TaskSortKey,
+		direction: SortDirection
+	): TaskInfo[] {
+		return sortFilterTasks(tasks, sortKey, direction, this.createTaskSortingContext());
+	}
+
+	private createTaskGroupingContext(): FilterTaskGroupingContext {
+		return {
+			userFields: this.runtime?.settings?.userFields || [],
+			hideCompletedFromOverdue: this.runtime?.settings?.hideCompletedFromOverdue,
+			currentSortKey: this.currentSortKey,
+			currentSortDirection: this.currentSortDirection,
+			isCompletedStatus: (status) => this.statusManager.isCompletedStatus(status),
+			getPriorityWeight: (priority) => this.priorityManager.getPriorityWeight(priority),
+			getStatusOrder: (status) => this.statusManager.getStatusOrder(status),
+			getUserFieldRawValue: (task, fieldKey) => this.getUserFieldRawValue(task, fieldKey),
+			resolveProjectToAbsolutePath: (projectValue) =>
+				this.resolveProjectToAbsolutePath(projectValue),
+			translate: (key, fallback, vars) => this.translate(key, fallback, vars),
+			getLocale: () => this.getLocale(),
+		};
+	}
+
+	private createTaskSortingContext(): FilterTaskSortingContext {
+		return {
+			userFields: this.runtime?.settings?.userFields || [],
+			getPriorityWeight: (priority) => this.priorityManager.getPriorityWeight(priority),
+			getStatusOrder: (status) => this.statusManager.getStatusOrder(status),
+			getUserFieldRawValue: (task, fieldKey) => this.getUserFieldRawValue(task, fieldKey),
+		};
+	}
+
+	private getUserFieldRawValue(task: TaskInfo, fieldKey: string): unknown {
+		try {
+			const app = this.cacheManager.getApp();
+			const file = app.vault.getAbstractFileByPath(task.path);
+			const frontmatter =
+				file instanceof TFile
+					? app.metadataCache.getFileCache(file)?.frontmatter
+					: undefined;
+			return frontmatter ? frontmatter[fieldKey] : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Get available filter options for building filter UI
+	 * Uses event-driven caching; TaskManager's filter indexes make recomputation cheap.
+	 */
+	async getFilterOptions(): Promise<FilterOptions> {
+		const now = Date.now();
+
+		// Return cached options if valid and not expired by fallback TTL
+		if (
+			this.filterOptionsCache &&
+			now - this.filterOptionsCacheTimestamp < this.filterOptionsCacheTTL
+		) {
+			this.filterOptionsCacheHits++;
+			return this.filterOptionsCache;
+		}
+
+		// Cache miss - compute fresh options
+
+		const freshOptions = buildFilterOptions({
+			statuses: this.statusManager.getAllStatuses(),
+			priorities: this.priorityManager.getAllPriorities(),
+			contexts: this.cacheManager.getAllContexts(),
+			projects: this.cacheManager.getAllProjects(),
+			tags: this.cacheManager.getAllTags(),
+			taskPaths: this.cacheManager.getAllTaskPaths(),
+			rootFolderLabel: this.translate("services.filter.folders.root", "(Root)"),
+			userFields: this.runtime?.settings?.userFields || [],
+		});
+
+		this.filterOptionsComputeCount++;
+
+		// Update cache and timestamp
+		this.filterOptionsCache = freshOptions;
+		this.filterOptionsCacheTimestamp = now;
+
+		return freshOptions;
+	}
+
+	/**
+	 * Invalidate cached filter options after an indexed field changes.
+	 */
+	private handleFilterIndexChanged(): void {
+		this.queryPlanner.clearIndexQueryCache();
+		this.invalidateFilterOptionsCache();
+	}
+
+	/**
+	 * Manually invalidate the filter options cache
+	 */
+	private invalidateFilterOptionsCache(): void {
+		if (this.filterOptionsCache) {
+			this.filterOptionsCache = null;
+		}
+	}
+
+	/**
+	 * Force refresh of filter options cache
+	 * This can be called by UI components when they detect stale data
+	 */
+	refreshFilterOptions(): void {
+		this.invalidateFilterOptionsCache();
+	}
+
+	/**
+	 * Get performance statistics for filter options caching
+	 */
+	getFilterOptionsCacheStats(): {
+		cacheHits: number;
+		computeCount: number;
+		hitRate: string;
+		isCurrentlyCached: boolean;
+		cacheAge: number;
+		ttlRemaining: number;
+	} {
+		const now = Date.now();
+		const cacheAge = this.filterOptionsCache ? now - this.filterOptionsCacheTimestamp : 0;
+		const ttlRemaining = this.filterOptionsCache
+			? Math.max(0, this.filterOptionsCacheTTL - cacheAge)
+			: 0;
+		const totalRequests = this.filterOptionsCacheHits + this.filterOptionsComputeCount;
+		const hitRate =
+			totalRequests > 0
+				? ((this.filterOptionsCacheHits / totalRequests) * 100).toFixed(1) + "%"
+				: "0%";
+
+		return {
+			cacheHits: this.filterOptionsCacheHits,
+			computeCount: this.filterOptionsComputeCount,
+			hitRate,
+			isCurrentlyCached: !!this.filterOptionsCache,
+			cacheAge,
+			ttlRemaining,
+		};
+	}
+
+	/**
+	 * Create a default filter query with the new structure
+	 */
+	createDefaultQuery(): FilterQuery {
+		return createDefaultFilterQuery(() => FilterUtils.generateId());
+	}
+
+	/**
+	 * Add quick toggle conditions (Show Completed, Show Archived, Hide Recurring)
+	 * These are syntactic sugar that programmatically modify the root query
+	 */
+	addQuickToggleCondition(
+		query: FilterQuery,
+		toggle: QuickFilterToggle,
+		enabled: boolean
+	): FilterQuery {
+		return applyQuickToggleCondition(query, toggle, enabled, () => FilterUtils.generateId());
+	}
+
+	/**
+	 * Validate and normalize a filter query
+	 */
+	normalizeQuery(query: Partial<FilterQuery>): FilterQuery {
+		return normalizeFilterQuery(query, () => FilterUtils.generateId());
+	}
+
+	/**
+	 * Subscribe to cache changes and emit refresh events
+	 */
+	initialize(): void {
+		this.cacheManager.on("file-updated", (event?: { filterIndexChanged?: boolean }) => {
+			if (event?.filterIndexChanged !== false) {
+				this.handleFilterIndexChanged();
+			}
+			this.emit("data-changed");
+		});
+
+		this.cacheManager.on("file-added", () => {
+			this.handleFilterIndexChanged();
+			this.emit("data-changed");
+		});
+
+		this.cacheManager.on("file-deleted", () => {
+			this.handleFilterIndexChanged();
+			this.emit("data-changed");
+		});
+
+		this.cacheManager.on("file-renamed", () => {
+			this.handleFilterIndexChanged();
+			this.emit("data-changed");
+		});
+
+		this.cacheManager.on("indexes-built", () => {
+			this.handleFilterIndexChanged();
+			this.emit("data-changed");
+		});
+	}
+
+	/**
+	 * Clean up event subscriptions and clear any caches
+	 */
+	cleanup(): void {
+		// Clear query result cache and timers
+		this.queryPlanner.clearIndexQueryCache();
+
+		// Clear filter options cache
+		this.invalidateFilterOptionsCache();
+
+		// Remove all event listeners
+		this.removeAllListeners();
+	}
+
+	// ============================================================================
+	// AGENDA-SPECIFIC METHODS
+	// ============================================================================
+
+	/**
+	 * Generate date range for agenda views from array of dates
+	 */
+	static createDateRangeFromDates(dates: Date[]): { start: string; end: string } {
+		if (dates.length === 0)
+			throw new Error(
+				FilterService.translateStatic(
+					"services.filter.errors.noDatesProvided",
+					"No dates provided"
+				)
+			);
+		const startDate = dates[0];
+		const endDate = dates[dates.length - 1];
+
+		return {
+			start: format(startDate, "yyyy-MM-dd"),
+			end: format(endDate, "yyyy-MM-dd"),
+		};
+	}
+
+	/**
+	 * Check if overdue tasks should be included for a date range
+	 */
+	static shouldIncludeOverdueForRange(dates: Date[], showOverdue: boolean): boolean {
+		if (!showOverdue) return false;
+
+		const today = new Date();
+		const todayStr = format(today, "yyyy-MM-dd");
+		return dates.some((date) => format(date, "yyyy-MM-dd") === todayStr);
+	}
+
+	/**
+	 * Get tasks for a specific date within an agenda view
+	 * Handles recurring tasks, due dates, scheduled dates, and overdue logic
+	 */
+	async getTasksForDate(
+		date: Date,
+		baseQuery: FilterQuery,
+		includeOverdue = false
+	): Promise<TaskInfo[]> {
+		// FIXED: Use UTC Anchor principle for consistent date handling
+		const dateStr = formatDateForStorage(date);
+		const isViewingToday = isTodayUtil(dateStr);
+
+		// Get all tasks and filter using new system
+		const allTaskPaths = this.cacheManager.getAllTaskPaths();
+		const allTasks = await this.pathsToTaskInfos(Array.from(allTaskPaths));
+		const filteredTasks = allTasks.filter((task) => this.evaluateFilterNode(baseQuery, task));
+		const hideCompletedFromOverdue = this.runtime?.settings?.hideCompletedFromOverdue ?? true;
+
+		const tasksForDate = filteredTasks.filter((task) =>
+			isTaskForAgendaDate(task, {
+				dateStr,
+				isViewingToday,
+				includeOverdue,
+				hideCompletedFromOverdue,
+				isCompletedStatus: (status) => this.statusManager.isCompletedStatus(status),
+			})
+		);
+
+		// Apply sorting to the filtered tasks for this date
+		return this.sortTasks(
+			tasksForDate,
+			baseQuery.sortKey || "due",
+			baseQuery.sortDirection || "asc"
+		);
+	}
+
+	/**
+	 * Get overdue tasks for the agenda view
+	 * These are tasks that have due or scheduled dates before today
+	 */
+	async getOverdueTasks(baseQuery: FilterQuery): Promise<TaskInfo[]> {
+		// Get all tasks and filter using the base query
+		const allTaskPaths = this.cacheManager.getAllTaskPaths();
+		const allTasks = await this.pathsToTaskInfos(Array.from(allTaskPaths));
+		const filteredTasks = allTasks.filter((task) => this.evaluateFilterNode(baseQuery, task));
+		const hideCompletedFromOverdue = this.runtime?.settings?.hideCompletedFromOverdue ?? true;
+
+		const overdueTasks = filteredTasks.filter((task) =>
+			isTaskOverdueForAgenda(task, {
+				hideCompletedFromOverdue,
+				isCompletedStatus: (status) => this.statusManager.isCompletedStatus(status),
+			})
+		);
+
+		// Apply sorting to the overdue tasks
+		return this.sortTasks(
+			overdueTasks,
+			baseQuery.sortKey || "due",
+			baseQuery.sortDirection || "asc"
+		);
+	}
+
+	/**
+	 * Get enhanced agenda data with separate overdue section
+	 */
+	async getAgendaDataWithOverdue(
+		dates: Date[],
+		baseQuery: FilterQuery,
+		showOverdueSection = false
+	): Promise<{
+		dailyData: Array<{ date: Date; tasks: TaskInfo[] }>;
+		overdueTasks: TaskInfo[];
+	}> {
+		// Get tasks for each specific date (no overdue mixing)
+		const dailyData: Array<{ date: Date; tasks: TaskInfo[] }> = [];
+		for (const date of dates) {
+			const tasksForDate = await this.getTasksForDate(
+				date,
+				baseQuery,
+				false // Never include overdue in daily sections
+			);
+
+			dailyData.push({
+				date: new Date(date),
+				tasks: tasksForDate,
+			});
+		}
+
+		// Get overdue tasks separately if requested
+		const overdueTasks = showOverdueSection ? await this.getOverdueTasks(baseQuery) : [];
+
+		return {
+			dailyData,
+			overdueTasks,
+		};
+	}
+
+	/**
+	 * Get agenda data grouped by dates for agenda views
+	 * Simplified for new filter system
+	 */
+	async getAgendaData(
+		dates: Date[],
+		baseQuery: FilterQuery,
+		showOverdueOnToday = false
+	): Promise<Array<{ date: Date; tasks: TaskInfo[] }>> {
+		const agendaData: Array<{ date: Date; tasks: TaskInfo[] }> = [];
+
+		// Get tasks for each date
+		for (const date of dates) {
+			const tasksForDate = await this.getTasksForDate(
+				date,
+				baseQuery,
+				showOverdueOnToday && isTodayUTC(date)
+			);
+
+			agendaData.push({
+				date: new Date(date),
+				tasks: tasksForDate,
+			});
+		}
+
+		return agendaData;
+	}
+
+	/**
+	 * Get flat agenda data (all tasks in one array) with date information attached
+	 * Useful for flat agenda view rendering
+	 */
+	async getFlatAgendaData(
+		dates: Date[],
+		baseQuery: FilterQuery,
+		showOverdueOnToday = false
+	): Promise<Array<TaskInfo & { agendaDate: Date }>> {
+		const groupedData = await this.getAgendaData(dates, baseQuery, showOverdueOnToday);
+
+		const flatData: Array<TaskInfo & { agendaDate: Date }> = [];
+
+		for (const dayData of groupedData) {
+			for (const task of dayData.tasks) {
+				flatData.push({
+					...task,
+					agendaDate: dayData.date,
+				});
+			}
+		}
+
+		return flatData;
+	}
+}

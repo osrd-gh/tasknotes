@@ -1,0 +1,2898 @@
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Legacy Bases view rendering narrows DOM references through lifecycle checks. */
+import { Menu, Notice, TFile, setIcon } from "obsidian";
+import type { BasesView, BasesViewFactory } from "obsidian";
+import TaskNotesPlugin from "../main";
+import { BasesViewBase } from "./BasesViewBase";
+import { TaskInfo } from "../types";
+import { identifyTaskNotesFromBasesData } from "./helpers";
+import { createTaskCard, showTaskContextMenu, type TaskCardOptions } from "../ui/TaskCard";
+import { renderGroupTitle } from "./groupTitleRenderer";
+import { type LinkServices } from "../ui/renderers/linkRenderer";
+import { DateContextMenu } from "../components/DateContextMenu";
+import { PriorityContextMenu } from "../components/PriorityContextMenu";
+import { RecurrenceContextMenu } from "../components/RecurrenceContextMenu";
+import { showConfirmationModal } from "../modals/ConfirmationModal";
+import { ReminderModal } from "../modals/ReminderModal";
+import {
+	getDatePart,
+	getTimePart,
+	getCurrentTimestamp,
+	parseDateToUTC,
+	createUTCDateFromLocalCalendarDate,
+} from "../utils/dateUtils";
+import { stringifyUnknown } from "../utils/stringUtils";
+import { VirtualScroller } from "../utils/VirtualScroller";
+import {
+	isSortOrderInSortConfig,
+	prepareSortOrderUpdate,
+	applySortOrderPlan,
+	DropOperationQueue,
+	type SortOrderPlan,
+} from "./sortOrderUtils";
+import { clearStaticStyleClasses } from "../utils/staticStyleClasses";
+import { computeBasesFormulas, isObsidianListProperty } from "./basesViewAdapters";
+import { coerceGroupKeyForFrontmatter as coercePropertyGroupKeyForFrontmatter } from "./propertyValueCoercion";
+import {
+	getTaskListDropSegments,
+	reconstructTaskListDropTarget,
+	resolveTaskListInsertionSlot,
+	type TaskListDropBaselineCard,
+	type TaskListDropSegment,
+	type TaskListInsertionSlot,
+} from "./taskListDragGeometry";
+import {
+	buildTaskListGroupedRenderItems,
+	buildTaskListGroupedScopePaths,
+	buildTaskListPathProperties,
+	buildTaskListSubPropertyRenderItems,
+	buildTaskListSubPropertyScopePaths,
+	groupTasksByTaskListSubProperty,
+	type TaskListGroup,
+	type TaskListHeaderItem,
+	type TaskListRenderItem,
+	type TaskListVirtualItem,
+} from "./taskListGrouping";
+import {
+	applyTaskListDropFrontmatterMutation,
+	buildTaskListDropSideEffectTask,
+	buildTaskListGroupDropPlan,
+} from "./taskListDropPlanning";
+import {
+	applySortOrderUpdatesToItems,
+	applySortOrderUpdatesToTaskCache,
+	buildSortOrderUpdateMap,
+	moveItemsRelativeToTarget,
+} from "./manualOrderState";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Bases/TaskListView" });
+
+type TaskListDataAdapterWithView = {
+	basesView: TaskListView;
+};
+
+type TaskListControllerView = {
+	name?: string;
+	groupBy?: string | { property?: string };
+};
+
+type TaskListController = {
+	query?: { views?: TaskListControllerView[] };
+	viewName?: string;
+};
+
+type TaskListEphemeralState = {
+	collapsedGroups?: unknown;
+	collapsedSubGroups?: unknown;
+	scrollTop?: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isTaskListEphemeralState(value: unknown): value is TaskListEphemeralState {
+	return isRecord(value);
+}
+
+function normalizeExpandedRelationshipFilterMode(value: unknown): "inherit" | "show-all" {
+	if (typeof value === "number") {
+		return value === 1 ? "show-all" : "inherit";
+	}
+
+	const normalized = stringifyUnknown(value)
+		.trim()
+		.toLowerCase()
+		.replace(/^['"]|['"]$/g, "")
+		.replace(/[_\s]+/g, "-");
+
+	if (normalized === "show-all" || normalized === "1") {
+		return "show-all";
+	}
+
+	if (normalized === "inherit" || normalized === "0") {
+		return "inherit";
+	}
+
+	return "inherit";
+}
+
+type DefaultCollapsedState = "Expanded" | "Collapsed";
+
+type GroupHierarchySnapshot = {
+	primaryGroupKeys: string[];
+	subGroupKeysByParent: Map<string, string[]>;
+};
+
+export class TaskListView extends BasesViewBase {
+	type = "tasknotesTaskList";
+
+	private configLoaded = false; // Track if we've successfully loaded config
+	private itemsContainer: HTMLElement | null = null;
+	private currentTaskElements = new Map<string, HTMLElement>();
+	private lastRenderWasGrouped = false;
+	private lastFlatPaths: string[] = [];
+	private lastVirtualItems: TaskListVirtualItem[] = [];
+	private lastTaskSignatures = new Map<string, string>();
+	private lastCardRenderSignature = "";
+	private taskInfoCache = new Map<string, TaskInfo>();
+	private clickTimeouts = new Map<string, number>();
+	private currentTargetDate = createUTCDateFromLocalCalendarDate(new Date());
+	private containerListenersRegistered = false;
+	private virtualScroller: VirtualScroller<TaskListVirtualItem> | null = null; // Can render TaskInfo or group headers
+	private useVirtualScrolling = false;
+	private collapsedGroups = new Set<string>(); // Track collapsed group keys
+	private collapsedSubGroups = new Set<string>(); // Track collapsed sub-group keys
+	private subGroupPropertyId: string | null = null; // Property ID for sub-grouping
+	private defaultCollapsedState: DefaultCollapsedState = "Expanded";
+	private expandedRelationshipFilterMode: TaskCardOptions["expandedRelationshipFilterMode"] =
+		"inherit";
+	private currentVisibleTaskPaths = new Set<string>();
+	private currentVisibleTaskOrder = new Map<string, number>();
+	private expandedRelationshipTaskPaths = new Set<string>();
+	private expandedRelationshipTaskOrder = new Map<string, number>();
+	private hideTopLevelSubtasks = false;
+	private currentPrimaryGroupKeys: string[] = [];
+	private currentSubGroupKeysByParent = new Map<string, string[]>();
+	private initializedPrimaryGroupKeys = new Set<string>();
+	private initializedSubGroupKeys = new Set<string>();
+	private deferCollapseDefaultForNextSnapshot = false;
+
+	// Drag-to-reorder state
+	private basesController: TaskListController;
+	private draggedTaskPath: string | null = null;
+	private dragGroupKey: string | null = null;
+	private currentInsertionGroupKey: string | null = null;
+	private currentInsertionSegmentIndex = -1;
+	private currentInsertionIndex = -1;
+	private pendingDragClientY: number | null = null;
+	private pendingRender = false;
+	private taskGroupKeys = new Map<string, string>(); // task path → group key (set during grouped render)
+	private sortScopeTaskPaths = new Map<string, string[]>();
+	private sortScopeCandidateTaskPaths = new Map<string, string[]>();
+	private dragOverRafId = 0; // rAF handle for throttled dragover
+	private dragContainer: HTMLElement | null = null; // Container holding siblings during drag
+	private currentDropSlotElement: HTMLElement | null = null;
+	private currentDropSlotPosition: "before" | "after" | null = null;
+	private dragBaselineCards: TaskListDropBaselineCard[] = [];
+	private dropQueue = new DropOperationQueue();
+
+	/**
+	 * Threshold for enabling virtual scrolling in task list view.
+	 * Virtual scrolling activates when total items (tasks + group headers) >= 100.
+	 * Benefits: ~90% memory reduction, eliminates UI lag for large lists.
+	 * Lower than KanbanView (30) because task cards are simpler/smaller.
+	 */
+	private readonly VIRTUAL_SCROLL_THRESHOLD = 100;
+	private readonly LARGE_REORDER_WARNING_THRESHOLD = 10;
+	private readonly UNGROUPED_SORT_SCOPE_KEY = "__ungrouped__";
+	private readonly CARD_NO_DRAG_SELECTOR =
+		'[data-tn-no-drag="true"], a, button, input, select, textarea, [contenteditable="true"]';
+	private readonly CARD_DRAG_HANDLE_SELECTOR = '[data-tn-drag-handle="true"]';
+
+	constructor(controller: unknown, containerEl: HTMLElement, plugin: TaskNotesPlugin) {
+		super(controller, containerEl, plugin);
+		this.basesController = controller as TaskListController;
+		// BasesView now provides this.data, this.config, and this.app directly
+		// Update the data adapter to use this BasesView instance
+		(this.dataAdapter as unknown as TaskListDataAdapterWithView).basesView = this;
+	}
+
+	/**
+	 * Component lifecycle: Called when view is first loaded.
+	 * Override from Component base class.
+	 */
+	onload(): void {
+		// Read view options now that config is available
+		this.readViewOptions();
+		// Call parent onload which sets up container and listeners
+		super.onload();
+		this.registerGroupContextMenuListeners();
+	}
+
+	/**
+	 * Register contextmenu listeners for group collapse actions.
+	 * - Right-click on a primary group header → expand/collapse branch
+	 * - Right-click on empty container area → expand/collapse all groups
+	 */
+	private registerGroupContextMenuListeners(): void {
+		if (!this.rootElement) return;
+
+		this.rootElement.addEventListener("contextmenu", (event: MouseEvent) => {
+			const target = event.target as HTMLElement;
+
+			// Check if right-clicking on a primary group header (not a subgroup)
+			const groupHeader = target.closest<HTMLElement>(".task-group-header");
+			if (groupHeader) {
+				const groupSection = groupHeader.closest<HTMLElement>(".task-group");
+				const groupKey = groupSection?.dataset.groupKey;
+				if (groupKey && !this.isSubGroupKey(groupKey)) {
+					event.preventDefault();
+					this.showGroupHeaderContextMenu(event, groupKey);
+					return;
+				}
+			}
+
+			// Check if right-clicking on empty area (not on a task card or group header)
+			const isOnTaskCard = target.closest(".task-card");
+			if (!isOnTaskCard && !groupHeader && this.currentPrimaryGroupKeys.length > 0) {
+				event.preventDefault();
+				this.showContainerContextMenu(event);
+			}
+		});
+	}
+
+	private showGroupHeaderContextMenu(event: MouseEvent, groupKey: string): void {
+		const subGroupKeys = this.currentSubGroupKeysByParent.get(groupKey);
+		if (!subGroupKeys || subGroupKeys.length === 0) return;
+
+		const allSubGroupsCollapsed = subGroupKeys.every((key) =>
+			this.collapsedSubGroups.has(key)
+		);
+		const menu = new Menu();
+
+		menu.addItem((item) => {
+			item.setTitle(allSubGroupsCollapsed ? "Expand subgroups" : "Collapse subgroups")
+				.setIcon(allSubGroupsCollapsed ? "list-tree" : "list-collapse")
+				.onClick(() => void this.setSubGroupsCollapsed(groupKey, !allSubGroupsCollapsed));
+		});
+
+		menu.showAtMouseEvent(event);
+	}
+
+	private showContainerContextMenu(event: MouseEvent): void {
+		const menu = new Menu();
+
+		menu.addItem((item) => {
+			item.setTitle("Expand all groups")
+				.setIcon("chevrons-down")
+				.onClick(() => void this.setAllPrimaryGroupsCollapsed(false));
+		});
+
+		menu.addItem((item) => {
+			item.setTitle("Collapse all groups")
+				.setIcon("chevrons-up")
+				.onClick(() => void this.setAllPrimaryGroupsCollapsed(true));
+		});
+
+		menu.addItem((item) => {
+			item.setTitle("Expand all groups and subgroups")
+				.setIcon("list-tree")
+				.onClick(() => void this.setAllGroupsAndSubGroupsCollapsed(false));
+		});
+
+		menu.addItem((item) => {
+			item.setTitle("Collapse all groups and subgroups")
+				.setIcon("list-collapse")
+				.onClick(() => void this.setAllGroupsAndSubGroupsCollapsed(true));
+		});
+
+		menu.showAtMouseEvent(event);
+	}
+
+	/**
+	 * Read view configuration options from BasesViewConfig.
+	 */
+	private readViewOptions(): void {
+		// Guard: config may not be set yet if called too early
+		if (!this.config || typeof this.config.get !== "function") {
+			tasknotesLogger.debug("[TaskListView] Config not available yet in readViewOptions", {
+				category: "configuration",
+				operation: "config-not-yet-readviewoptions",
+			});
+			return;
+		}
+
+		try {
+			this.subGroupPropertyId = this.config.getAsPropertyId("subGroup");
+			// Read enableSearch toggle (default: false for backward compatibility)
+			const enableSearchValue = this.config.get("enableSearch");
+			this.enableSearch = (enableSearchValue as boolean) ?? false;
+			const defaultCollapsedStateValue = this.config.get("defaultCollapsedState");
+
+			this.defaultCollapsedState =
+				defaultCollapsedStateValue === "Collapsed" || defaultCollapsedStateValue === "1"
+					? "Collapsed"
+					: "Expanded";
+			const expandedRelationshipFilterModeValue = this.config.get(
+				"expandedRelationshipFilterMode"
+			);
+			this.expandedRelationshipFilterMode = normalizeExpandedRelationshipFilterMode(
+				expandedRelationshipFilterModeValue
+			);
+			this.hideTopLevelSubtasks = this.config.get("hideTopLevelSubtasks") === true;
+			// Mark config as successfully loaded
+			this.configLoaded = true;
+		} catch (e) {
+			// Use defaults
+			tasknotesLogger.warn("[TaskListView] Failed to parse config:", {
+				category: "configuration",
+				operation: "parse-config",
+				error: e,
+			});
+		}
+	}
+
+	private clearGroupingSnapshot(): void {
+		this.currentPrimaryGroupKeys = [];
+		this.currentSubGroupKeysByParent.clear();
+	}
+
+	private initializeCollapseStateForSnapshot(
+		primaryGroupKeys: string[],
+		subGroupKeysByParent: Map<string, string[]>
+	): void {
+		const shouldSeedCollapsedState =
+			this.defaultCollapsedState === "Collapsed" && !this.deferCollapseDefaultForNextSnapshot;
+
+		for (const primaryGroupKey of primaryGroupKeys) {
+			if (this.initializedPrimaryGroupKeys.has(primaryGroupKey)) {
+				continue;
+			}
+
+			this.initializedPrimaryGroupKeys.add(primaryGroupKey);
+			if (shouldSeedCollapsedState) {
+				this.collapsedGroups.add(primaryGroupKey);
+			}
+		}
+
+		for (const subGroupKeys of subGroupKeysByParent.values()) {
+			for (const subGroupKey of subGroupKeys) {
+				if (this.initializedSubGroupKeys.has(subGroupKey)) {
+					continue;
+				}
+
+				this.initializedSubGroupKeys.add(subGroupKey);
+				if (shouldSeedCollapsedState) {
+					this.collapsedSubGroups.add(subGroupKey);
+				}
+			}
+		}
+
+		this.deferCollapseDefaultForNextSnapshot = false;
+	}
+
+	private applyGroupingSnapshot(snapshot: GroupHierarchySnapshot): void {
+		const subGroupKeysByParent = new Map<string, string[]>();
+		for (const [primaryKey, subGroupKeys] of snapshot.subGroupKeysByParent.entries()) {
+			subGroupKeysByParent.set(primaryKey, [...subGroupKeys]);
+		}
+
+		this.initializeCollapseStateForSnapshot(snapshot.primaryGroupKeys, subGroupKeysByParent);
+		this.currentPrimaryGroupKeys = [...snapshot.primaryGroupKeys];
+		this.currentSubGroupKeysByParent = subGroupKeysByParent;
+	}
+
+	private createGroupedHierarchySnapshot(
+		groups: readonly TaskListGroup[],
+		taskNotes: readonly TaskInfo[]
+	): GroupHierarchySnapshot {
+		const snapshot: GroupHierarchySnapshot = {
+			primaryGroupKeys: [],
+			subGroupKeysByParent: new Map<string, string[]>(),
+		};
+		const pathToProps = this.subGroupPropertyId
+			? buildTaskListPathProperties(this.dataAdapter.extractDataItems())
+			: new Map<string, Record<string, unknown>>();
+
+		for (const group of groups) {
+			const primaryKey = this.dataAdapter.convertGroupKeyToString(group.key);
+			const groupPaths = new Set(group.entries.map((entry) => entry.file?.path));
+			const groupTasks = taskNotes.filter((task) => groupPaths.has(task.path));
+
+			if (groupTasks.length === 0) {
+				continue;
+			}
+
+			snapshot.primaryGroupKeys.push(primaryKey);
+			if (!this.subGroupPropertyId) {
+				continue;
+			}
+
+			const subGroupKeys: string[] = [];
+			const subGroups = groupTasksByTaskListSubProperty(
+				groupTasks,
+				this.subGroupPropertyId,
+				pathToProps
+			);
+
+			for (const [subKey, subTasks] of subGroups) {
+				if (subTasks.length === 0) {
+					continue;
+				}
+				subGroupKeys.push(`${primaryKey}:${subKey}`);
+			}
+
+			if (subGroupKeys.length > 0) {
+				snapshot.subGroupKeysByParent.set(primaryKey, subGroupKeys);
+			}
+		}
+
+		return snapshot;
+	}
+
+	private createSubPropertyHierarchySnapshot(
+		groupedTasks: Map<string, TaskInfo[]>
+	): GroupHierarchySnapshot {
+		return {
+			primaryGroupKeys: Array.from(groupedTasks.keys()),
+			subGroupKeysByParent: new Map<string, string[]>(),
+		};
+	}
+
+	protected setupContainer(): void {
+		super.setupContainer();
+
+		// Make rootElement fill its container and establish flex context
+		if (this.rootElement) {
+			this.rootElement.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-75816cae",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-display-none-6b99de8b",
+				"tn-static-flex-direction-column-06c8b5ed",
+				"tn-static-height-0-7a31cef0",
+				"tn-static-height-100-62264068",
+				"tn-static-height-12px-06c0747e",
+				"tn-static-height-16px-30de4aee",
+				"tn-static-height-24px-29a11d37",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			this.rootElement.classList.add("tn-static-display-flex-4d51fc62");
+		}
+
+		// Use correct document for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+
+		// Create items container
+		const itemsContainer = doc.createElement("div");
+		itemsContainer.className = "tn-bases-items-container";
+		// Use flex: 1 to fill available space in the rootElement flex container
+		// max-height: 100vh prevents unbounded growth when embedded in notes
+		// overflow-y: auto provides scrolling when content exceeds available height
+		itemsContainer.classList.remove(
+			"tn-static-flex-1-14e3b769",
+			"tn-static-flex-1-97445a8d",
+			"tn-static-font-size-12px-b0cc7e05",
+			"tn-static-margin-top-0-5rem-3dc98b5e",
+			"tn-static-margin-top-0-d462248a",
+			"tn-static-margin-top-16px-1b0f4999",
+			"tn-static-margin-top-1rem-2239d6d5",
+			"tn-static-margin-top-20px-a26bda7d",
+			"tn-static-margin-top-30px-2fbbbcd4",
+			"tn-static-margin-top-4px-96ad6099",
+			"tn-static-margin-top-8px-8a77e5a3",
+			"tn-static-margin-top-8px-f4f01e68",
+			"tn-static-max-height-400px-f0787633",
+			"tn-static-overflow-y-auto-03df744e",
+			"tn-static-overflow-y-clip-c5043043",
+			"tn-static-position-relative-d461c96d"
+		);
+		itemsContainer.classList.add("tn-static-margin-top-12px-91e0f558");
+		this.rootElement?.appendChild(itemsContainer);
+		this.itemsContainer = itemsContainer;
+		this.registerContainerListeners();
+		this.setupContainerDragHandlers();
+	}
+
+	async render(): Promise<void> {
+		if (!this.itemsContainer || !this.rootElement) return;
+
+		// Defer re-render while a drag is in progress — re-rendering
+		// destroys card elements and their event listeners, which
+		// causes the drop event to never fire.
+		if (this.draggedTaskPath) {
+			this.pendingRender = true;
+			return;
+		}
+
+		// Always re-read view options to catch config changes such as
+		// switching expanded relationship filtering modes in Bases.
+		if (this.config) {
+			this.readViewOptions();
+		}
+
+		// Now that config is loaded, setup search (idempotent: will only create once)
+		if (this.rootElement) {
+			this.setupSearch(this.rootElement);
+		}
+		try {
+			// Skip rendering if we have no data yet (prevents flickering during data updates)
+			if (!this.data?.data) {
+				this.clearGroupingSnapshot();
+				return;
+			}
+
+			// Extract data using adapter (adapter now uses this as basesView)
+			const dataItems = this.dataAdapter.extractDataItems();
+
+			// Compute Bases formulas for TaskNotes items
+			computeBasesFormulas(this.data, dataItems);
+
+			const taskNotes = await identifyTaskNotesFromBasesData(dataItems, this.plugin);
+
+			if (taskNotes.length === 0) {
+				this.clearAllTaskElements();
+				this.sortScopeTaskPaths.clear();
+				this.sortScopeCandidateTaskPaths.clear();
+				this.clearGroupingSnapshot();
+				this.renderEmptyState();
+				this.lastRenderWasGrouped = false;
+				return;
+			}
+
+			const isGrouped = this.dataAdapter.isGrouped();
+
+			// Special case: if sub-grouping is configured but primary grouping is not,
+			// treat sub-group property as primary grouping
+			if (!isGrouped && this.subGroupPropertyId) {
+				if (!this.lastRenderWasGrouped) {
+					this.clearAllTaskElements();
+				}
+				await this.renderGroupedBySubProperty(taskNotes);
+				this.lastRenderWasGrouped = true;
+			} else if (isGrouped) {
+				if (!this.lastRenderWasGrouped) {
+					this.clearAllTaskElements();
+				}
+				await this.renderGrouped(taskNotes);
+				this.lastRenderWasGrouped = true;
+			} else {
+				if (this.lastRenderWasGrouped) {
+					this.clearAllTaskElements();
+				}
+				this.clearGroupingSnapshot();
+				await this.renderFlat(taskNotes);
+				this.lastRenderWasGrouped = false;
+			}
+			// Check if we have grouped data
+		} catch (error: unknown) {
+			tasknotesLogger.error("[TaskNotes][TaskListView] Error rendering:", {
+				category: "persistence",
+				operation: "rendering",
+				error: error,
+			});
+			this.clearAllTaskElements();
+			this.sortScopeTaskPaths.clear();
+			this.sortScopeCandidateTaskPaths.clear();
+			this.renderError(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	// ── Drag-to-reorder ────────────────────────────────────────────────
+
+	private getGroupByPropertyId(): string | null {
+		const controller = this.basesController;
+		if (controller?.query?.views && controller?.viewName) {
+			for (const view of controller.query.views) {
+				if (view?.name === controller.viewName) {
+					if (view.groupBy) {
+						if (typeof view.groupBy === "object" && view.groupBy.property)
+							return view.groupBy.property;
+						if (typeof view.groupBy === "string") return view.groupBy;
+					}
+					return null;
+				}
+			}
+		}
+		return null;
+	}
+
+	private getSortScopeKey(groupKey: string | null): string {
+		return groupKey ?? this.UNGROUPED_SORT_SCOPE_KEY;
+	}
+
+	private getVisibleSortScopePaths(groupKey: string | null): string[] | undefined {
+		return this.sortScopeTaskPaths.get(this.getSortScopeKey(groupKey));
+	}
+
+	private getCandidateSortScopePaths(groupKey: string | null): string[] | undefined {
+		return this.sortScopeCandidateTaskPaths.get(this.getSortScopeKey(groupKey));
+	}
+
+	private setSortScopePaths(entries: Iterable<[string | null, string[]]>): void {
+		this.sortScopeTaskPaths.clear();
+		for (const [groupKey, paths] of entries) {
+			this.sortScopeTaskPaths.set(this.getSortScopeKey(groupKey), [...paths]);
+		}
+	}
+
+	private setSortScopeCandidatePaths(entries: Iterable<[string | null, string[]]>): void {
+		this.sortScopeCandidateTaskPaths.clear();
+		for (const [groupKey, paths] of entries) {
+			this.sortScopeCandidateTaskPaths.set(this.getSortScopeKey(groupKey), [...paths]);
+		}
+	}
+
+	private getVirtualItemTask(item: TaskListVirtualItem): TaskInfo | null {
+		if ("type" in item) {
+			return item.type === "task" ? item.task : null;
+		}
+		return item;
+	}
+
+	private getVirtualItemPath(item: TaskListVirtualItem): string | null {
+		return this.getVirtualItemTask(item)?.path ?? null;
+	}
+
+	private getVirtualItemGroupKey(item: TaskListVirtualItem): string | null {
+		if ("type" in item) {
+			return item.type === "task" ? item.groupKey : null;
+		}
+		return null;
+	}
+
+	private rebuildSortScopesFromVirtualItems(items: TaskListVirtualItem[]): void {
+		const groupedPaths = new Map<string | null, string[]>();
+		const flatPaths: string[] = [];
+
+		for (const item of items) {
+			const task = this.getVirtualItemTask(item);
+			if (!task) continue;
+
+			flatPaths.push(task.path);
+			const groupKey = this.getVirtualItemGroupKey(item);
+			const paths = groupedPaths.get(groupKey) ?? [];
+			paths.push(task.path);
+			groupedPaths.set(groupKey, paths);
+		}
+
+		if (groupedPaths.size > 0) {
+			this.setSortScopePaths(groupedPaths);
+		} else {
+			this.setSortScopePaths([[null, flatPaths]]);
+		}
+	}
+
+	private applyOptimisticSortOrderResult(
+		draggedPath: string,
+		targetPath: string,
+		above: boolean,
+		targetGroupKey: string | null,
+		sourceGroupKey: string | null,
+		sortOrderPlan: SortOrderPlan
+	): boolean {
+		if (sourceGroupKey !== targetGroupKey) {
+			return false;
+		}
+
+		const sortOrdersByPath = buildSortOrderUpdateMap(draggedPath, sortOrderPlan);
+		applySortOrderUpdatesToTaskCache(this.taskInfoCache, sortOrdersByPath, (task) => {
+			this.lastTaskSignatures.set(task.path, this.buildTaskSignature(task));
+		});
+
+		if (this.virtualScroller && this.lastVirtualItems.length > 0) {
+			const items = moveItemsRelativeToTarget(
+				this.lastVirtualItems,
+				(item) => this.getVirtualItemPath(item),
+				[draggedPath],
+				targetPath,
+				above
+			);
+			if (!items) {
+				return false;
+			}
+
+			applySortOrderUpdatesToItems(
+				items,
+				(item) => this.getVirtualItemTask(item),
+				sortOrdersByPath,
+				(task) => {
+					this.taskInfoCache.set(task.path, task);
+					this.lastTaskSignatures.set(task.path, this.buildTaskSignature(task));
+				}
+			);
+
+			this.lastVirtualItems = items;
+			this.virtualScroller.updateItems(items);
+			this.rebuildSortScopesFromVirtualItems(items);
+			this.setCurrentVisibleTaskPaths(
+				items
+					.map((item) => this.getVirtualItemTask(item))
+					.filter((task): task is TaskInfo => !!task)
+			);
+			this.lastFlatPaths = items
+				.map((item) => this.getVirtualItemPath(item))
+				.filter((path): path is string => !!path);
+			return true;
+		}
+
+		const draggedCard = this.itemsContainer?.querySelector<HTMLElement>(
+			`.task-card[data-task-path="${CSS.escape(draggedPath)}"]`
+		);
+		const targetCard = this.itemsContainer?.querySelector<HTMLElement>(
+			`.task-card[data-task-path="${CSS.escape(targetPath)}"]`
+		);
+		if (!draggedCard || !targetCard) {
+			return false;
+		}
+
+		if (above) {
+			targetCard.before(draggedCard);
+		} else {
+			targetCard.after(draggedCard);
+		}
+		return true;
+	}
+
+	private isListTypeProperty(propertyName: string): boolean {
+		if (isObsidianListProperty(this.plugin.app, propertyName)) {
+			return true;
+		}
+
+		const contextsField = this.plugin.fieldMapper.toUserField("contexts");
+		const projectsField = this.plugin.fieldMapper.toUserField("projects");
+
+		return new Set([
+			"contexts",
+			contextsField,
+			"projects",
+			projectsField,
+			"tags",
+			"aliases",
+		]).has(propertyName);
+	}
+
+	private coerceGroupKeyForFrontmatter(
+		property: string,
+		groupKey: string
+	): string | number | boolean {
+		return coercePropertyGroupKeyForFrontmatter(
+			this.plugin.app,
+			property,
+			groupKey,
+			this.plugin.settings.userFields
+		);
+	}
+
+	private async confirmLargeReorder(
+		editCount: number,
+		targetGroupKey: string | null
+	): Promise<boolean> {
+		const sortOrderField = this.plugin.settings.fieldMapping.sortOrder;
+		const scopeLabel =
+			targetGroupKey === null
+				? this.plugin.i18n.translate("views.taskList.reorder.scope.ungrouped")
+				: this.plugin.i18n.translate("views.taskList.reorder.scope.group", {
+						group: targetGroupKey,
+					});
+
+		return showConfirmationModal(this.plugin.app, {
+			title: this.plugin.i18n.translate("common.reorder.confirmLargeTitle"),
+			message: this.plugin.i18n.translate("common.reorder.confirmLargeMessage", {
+				field: sortOrderField,
+				count: editCount,
+				scope: scopeLabel,
+			}),
+			confirmText: this.plugin.i18n.translate("common.reorder.confirmButton"),
+			cancelText: this.plugin.i18n.translate("common.cancel"),
+		});
+	}
+
+	private getEventTargetElement(target: EventTarget | null): HTMLElement | null {
+		const node = target as Node | null;
+		if (!node || typeof node.nodeType !== "number") {
+			return null;
+		}
+
+		return node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
+	}
+
+	private shouldSuppressCardDrag(target: EventTarget | null, cardEl: HTMLElement): boolean {
+		const targetEl = this.getEventTargetElement(target);
+		if (!targetEl || !cardEl.contains(targetEl)) {
+			return false;
+		}
+
+		if (targetEl.closest(this.CARD_NO_DRAG_SELECTOR)) {
+			return true;
+		}
+
+		return (
+			this.isMobileDragHandleOnlyMode(cardEl) &&
+			!targetEl.closest(this.CARD_DRAG_HANDLE_SELECTOR)
+		);
+	}
+
+	private isMobileDragHandleOnlyMode(cardEl: HTMLElement): boolean {
+		return cardEl.ownerDocument.body.classList.contains("is-mobile");
+	}
+
+	private setupCardDragHandle(cardEl: HTMLElement): void {
+		cardEl.classList.add("task-card--reorderable");
+		cardEl.classList.toggle(
+			"task-card--drag-handle-only",
+			this.isMobileDragHandleOnlyMode(cardEl)
+		);
+
+		const existingHandle = cardEl.querySelector<HTMLElement>(this.CARD_DRAG_HANDLE_SELECTOR);
+		if (existingHandle) {
+			existingHandle.setAttribute("draggable", "true");
+			return;
+		}
+
+		const handle = cardEl.ownerDocument.createElement("div");
+		handle.className = "task-card__drag-handle";
+		handle.dataset.tnDragHandle = "true";
+		handle.setAttribute("draggable", "true");
+		handle.setAttribute("aria-label", "Drag to reorder");
+		handle.setAttribute("title", "Drag to reorder");
+		setIcon(handle, "grip-vertical");
+		handle.addEventListener("click", (event) => {
+			event.preventDefault();
+			event.stopPropagation();
+		});
+		cardEl.insertBefore(handle, cardEl.firstChild);
+	}
+
+	/**
+	 * Attach a dragstart handler to a single card element.
+	 * Drop-target handling (dragover/drop) is done via container-level delegation
+	 * in setupContainerDragHandlers() for robustness with virtual scrolling.
+	 */
+	private setupCardDragHandlers(
+		cardEl: HTMLElement,
+		task: TaskInfo,
+		groupKey: string | null
+	): void {
+		let dragOriginTarget: EventTarget | null = null;
+		const restoreCardDraggable = () => {
+			cardEl.setAttribute(
+				"draggable",
+				this.isMobileDragHandleOnlyMode(cardEl) ? "false" : "true"
+			);
+			dragOriginTarget = null;
+		};
+
+		this.setupCardDragHandle(cardEl);
+		restoreCardDraggable();
+
+		cardEl.addEventListener(
+			"mousedown",
+			(e: MouseEvent) => {
+				dragOriginTarget = e.target;
+				cardEl.setAttribute(
+					"draggable",
+					this.shouldSuppressCardDrag(e.target, cardEl) ? "false" : "true"
+				);
+			},
+			{ capture: true }
+		);
+		cardEl.addEventListener("mouseup", restoreCardDraggable);
+		cardEl.addEventListener("click", restoreCardDraggable, { capture: true });
+
+		cardEl.addEventListener("dragstart", (e: DragEvent) => {
+			if (this.shouldSuppressCardDrag(dragOriginTarget ?? e.target, cardEl)) {
+				e.preventDefault();
+				e.stopPropagation();
+				restoreCardDraggable();
+				return;
+			}
+
+			this.draggedTaskPath = task.path;
+			this.dragGroupKey = groupKey;
+			cardEl.classList.add("task-card--dragging");
+			if (e.dataTransfer) {
+				e.dataTransfer.effectAllowed = "move";
+				e.dataTransfer.setData("text/plain", task.path);
+			}
+
+			// Add body-level class to suppress hover lift on siblings
+			this.containerEl.ownerDocument.body.classList.add("tn-drag-active");
+
+			// Measure card height before collapse (for gap/slot sizing)
+			const draggedHeight = cardEl.getBoundingClientRect().height;
+			const container = this.itemsContainer;
+
+			// Collapse dragged card on next frame (after browser captures drag image)
+			window.requestAnimationFrame(() => {
+				cardEl.classList.remove(
+					"tn-static-display-flex-4d51fc62",
+					"tn-static-height-100-62264068",
+					"tn-static-height-12px-06c0747e",
+					"tn-static-height-16px-30de4aee",
+					"tn-static-height-24px-29a11d37",
+					"tn-static-min-height-800px-997b4c8c"
+				);
+				cardEl.classList.add("tn-static-height-0-7a31cef0");
+				cardEl.classList.remove("tn-static-flex-1-14e3b769");
+				cardEl.classList.add("tn-static-overflow-hidden-69824400");
+				cardEl.classList.remove(
+					"tn-static-margin-8px-0-0-0-a2eb8382",
+					"tn-static-padding-0-16px-16px-16px-f1aa998c",
+					"tn-static-padding-12px-43bef435",
+					"tn-static-padding-16px-287f770e",
+					"tn-static-padding-20px-769fed37",
+					"tn-static-padding-20px-7a035d95",
+					"tn-static-padding-20px-ebe8e48c",
+					"tn-static-padding-2px-8px-c8eea84a",
+					"tn-static-padding-2rem-42aa6d9c"
+				);
+				cardEl.classList.add("tn-static-padding-0-41d7d7e2");
+				cardEl.classList.remove(
+					"tn-static-margin-0-auto-266e9b04",
+					"tn-static-margin-0-db0d5f36",
+					"tn-static-margin-0-var-size-4-2-77f7dc08",
+					"tn-static-margin-2px-0-edce9b14",
+					"tn-static-margin-8px-0-0-0-a2eb8382",
+					"tn-static-padding-12px-43bef435",
+					"tn-static-padding-20px-ebe8e48c"
+				);
+				cardEl.classList.add("tn-static-margin-0-11696618");
+				cardEl.classList.remove(
+					"tn-static-border-1px-solid-var-background-mo-b65b5121",
+					"tn-static-padding-12px-43bef435"
+				);
+				cardEl.classList.add("tn-static-border-none-2eda1daa");
+				cardEl.classList.remove(
+					"tn-static-opacity-0-6-d95b59ac",
+					"tn-static-opacity-1-c6e7979d"
+				);
+				cardEl.classList.add("tn-static-opacity-0-8d919cb5");
+
+				// Set up gap/slot on siblings
+				if (container) {
+					const gapStr = getComputedStyle(container).gap;
+					const gap = parseFloat(gapStr) || 4;
+					container.style.setProperty("--tn-drag-gap", `${draggedHeight + gap}px`);
+					this.dragContainer = container;
+					this.currentInsertionGroupKey = groupKey;
+					this.currentInsertionSegmentIndex = -1;
+					this.currentInsertionIndex = -1;
+					this.currentDropSlotElement = null;
+					this.currentDropSlotPosition = null;
+					this.captureDropBaseline();
+				}
+			});
+		});
+
+		cardEl.addEventListener("dragend", () => {
+			restoreCardDraggable();
+
+			// Restore collapsed card
+			clearStaticStyleClasses(cardEl);
+			cardEl.classList.remove("task-card--dragging");
+
+			// Clean up gap/slot state
+			this.cleanupDragShift();
+			this.containerEl.ownerDocument.body.classList.remove("tn-drag-active");
+
+			this.draggedTaskPath = null;
+			this.dragGroupKey = null;
+			this.currentInsertionGroupKey = null;
+			this.currentInsertionSegmentIndex = -1;
+			this.currentInsertionIndex = -1;
+
+			// Cancel any pending rAF
+			if (this.dragOverRafId) {
+				cancelAnimationFrame(this.dragOverRafId);
+				this.dragOverRafId = 0;
+			}
+			this.pendingDragClientY = null;
+
+			// Flush any render that was deferred while dragging
+			if (this.pendingRender) {
+				const win = this.containerEl.ownerDocument.defaultView || window;
+				win.setTimeout(() => {
+					if (this.pendingRender) {
+						this.pendingRender = false;
+						this.debouncedRefresh();
+					}
+				}, 200);
+			}
+		});
+	}
+
+	private shouldEnableManualReordering(): boolean {
+		return isSortOrderInSortConfig(
+			this.dataAdapter,
+			this.plugin.settings.fieldMapping.sortOrder
+		);
+	}
+
+	private configureCardForManualReordering(
+		cardEl: HTMLElement,
+		task: TaskInfo,
+		groupKey: string | null
+	): void {
+		if (!this.shouldEnableManualReordering()) {
+			return;
+		}
+
+		cardEl.setAttribute("draggable", "true");
+		this.setupCardDragHandlers(cardEl, task, groupKey);
+	}
+
+	private clearDropIndicators(): void {
+		this.itemsContainer
+			?.querySelectorAll(
+				".task-card--drop-above, .task-card--drop-below, .task-list-view__drop-slot-before, .task-list-view__drop-slot-after"
+			)
+			.forEach((el) => {
+				el.classList.remove(
+					"task-card--drop-above",
+					"task-card--drop-below",
+					"task-list-view__drop-slot-before",
+					"task-list-view__drop-slot-after"
+				);
+			});
+		this.currentDropSlotElement = null;
+		this.currentDropSlotPosition = null;
+	}
+
+	/**
+	 * Remove all gap/slot shift classes and custom properties.
+	 */
+	private cleanupDragShift(): void {
+		if (this.dragContainer) {
+			this.dragContainer.style.removeProperty("--tn-drag-gap");
+		}
+		// Clean from entire items container (safety net)
+		this.itemsContainer
+			?.querySelectorAll<HTMLElement>(
+				".task-card--drag-shift, .task-card--shift-down, .task-list-view__drop-slot-before, .task-list-view__drop-slot-after"
+			)
+			.forEach((el) => {
+				el.classList.remove(
+					"task-card--drag-shift",
+					"task-card--shift-down",
+					"task-list-view__drop-slot-before",
+					"task-list-view__drop-slot-after"
+				);
+			});
+		this.dragContainer = null;
+		this.currentDropSlotElement = null;
+		this.currentDropSlotPosition = null;
+		this.currentInsertionGroupKey = null;
+		this.currentInsertionSegmentIndex = -1;
+		this.currentInsertionIndex = -1;
+		this.dragBaselineCards = [];
+	}
+
+	private getDropSegments(): TaskListDropSegment[] {
+		return getTaskListDropSegments(this.getDropBaselineCards());
+	}
+
+	private reconstructDropTargetFromInsertionSlot(
+		segmentIndex: number,
+		insertionIndex: number
+	): { taskPath: string; above: boolean } | null {
+		return reconstructTaskListDropTarget(this.getDropSegments(), segmentIndex, insertionIndex);
+	}
+
+	private getCurrentInsertionTarget(): { taskPath: string; above: boolean } | null {
+		if (this.currentInsertionSegmentIndex < 0 || this.currentInsertionIndex < 0) return null;
+		return this.reconstructDropTargetFromInsertionSlot(
+			this.currentInsertionSegmentIndex,
+			this.currentInsertionIndex
+		);
+	}
+
+	private getVisibleSortScopePathsForDrag(groupKey: string | null): string[] | undefined {
+		return this.getVisibleSortScopePaths(groupKey);
+	}
+
+	private getReorderScopeQueueKey(
+		groupKey: string | null,
+		groupByPropertyId: string | null
+	): string {
+		if (!groupByPropertyId) {
+			return "manual-sort:list";
+		}
+
+		return `manual-sort:${groupByPropertyId}:${this.getSortScopeKey(groupKey)}`;
+	}
+
+	private syncGroupedDragMetadata(items: TaskListRenderItem[]): void {
+		this.taskGroupKeys.clear();
+		const groupedPaths = new Map<string | null, string[]>();
+		for (const item of items) {
+			if (item.type !== "task") continue;
+			this.taskGroupKeys.set(item.task.path, item.groupKey);
+			const paths = groupedPaths.get(item.groupKey) || [];
+			paths.push(item.task.path);
+			groupedPaths.set(item.groupKey, paths);
+		}
+		this.setSortScopePaths(groupedPaths);
+	}
+
+	private updateDropSlotPreview(slot: TaskListInsertionSlot): void {
+		const { element, position } = slot;
+		if (element === this.currentDropSlotElement && position === this.currentDropSlotPosition) {
+			return;
+		}
+
+		this.clearDropIndicators();
+		element.classList.add(
+			position === "before"
+				? "task-list-view__drop-slot-before"
+				: "task-list-view__drop-slot-after"
+		);
+		this.currentDropSlotElement = element;
+		this.currentDropSlotPosition = position;
+	}
+
+	private updateResolvedInsertionSlot(clientY: number): boolean {
+		const insertionSlot = this.resolveClosestInsertionSlot(clientY);
+		if (!insertionSlot) return false;
+
+		this.currentInsertionGroupKey = insertionSlot.groupKey;
+		this.currentInsertionSegmentIndex = insertionSlot.segmentIndex;
+		this.currentInsertionIndex = insertionSlot.insertionIndex;
+		this.updateDropSlotPreview(insertionSlot);
+		return true;
+	}
+
+	private flushPendingInsertionSlot(clientYFallback: number): boolean {
+		if (this.dragOverRafId) {
+			cancelAnimationFrame(this.dragOverRafId);
+			this.dragOverRafId = 0;
+		}
+
+		this.pendingDragClientY = null;
+		return this.updateResolvedInsertionSlot(clientYFallback);
+	}
+
+	private getVisibleDropCards(): HTMLElement[] {
+		if (!this.itemsContainer) return [];
+
+		return Array.from(
+			this.itemsContainer.querySelectorAll<HTMLElement>(".task-card[data-task-path]")
+		).filter((card) => {
+			if (card.dataset.taskPath === this.draggedTaskPath) return false;
+			const parentTaskCard = card.parentElement?.closest<HTMLElement>(
+				".task-card[data-task-path]"
+			);
+			return !parentTaskCard;
+		});
+	}
+
+	private captureDropBaseline(cards = this.getVisibleDropCards()): void {
+		if (!this.itemsContainer) {
+			this.dragBaselineCards = [];
+			return;
+		}
+
+		const containerRect = this.itemsContainer.getBoundingClientRect();
+		const scrollTop = this.itemsContainer.scrollTop;
+		this.dragBaselineCards = cards
+			.map((card) => {
+				const path = card.dataset.taskPath;
+				if (!path) return null;
+				const rect = card.getBoundingClientRect();
+				const top = rect.top - containerRect.top + scrollTop;
+				return {
+					path,
+					groupKey: this.taskGroupKeys.get(path) ?? null,
+					card,
+					top,
+					bottom: top + rect.height,
+					midpoint: top + rect.height / 2,
+				};
+			})
+			.filter((entry): entry is TaskListDropBaselineCard => !!entry);
+	}
+
+	private getDropBaselineCards(): TaskListDropBaselineCard[] {
+		const cards = this.getVisibleDropCards();
+		const currentPaths = cards.map((card) => card.dataset.taskPath ?? "");
+		const baselinePaths = this.dragBaselineCards.map((entry) => entry.path);
+		const baselineIsCurrent =
+			currentPaths.length === baselinePaths.length &&
+			currentPaths.every((path, index) => path === baselinePaths[index]);
+
+		if (!baselineIsCurrent) {
+			this.captureDropBaseline(cards);
+		}
+
+		return this.dragBaselineCards;
+	}
+
+	private getContainerLocalY(clientY: number): number {
+		if (!this.itemsContainer) return clientY;
+		const containerRect = this.itemsContainer.getBoundingClientRect();
+		return clientY - containerRect.top + this.itemsContainer.scrollTop;
+	}
+
+	private resolveClosestInsertionSlot(clientY: number): TaskListInsertionSlot | null {
+		const segments = this.getDropSegments();
+		const localY = this.getContainerLocalY(clientY);
+		return resolveTaskListInsertionSlot(segments, localY);
+	}
+
+	/**
+	 * Container-level drag event delegation.
+	 * Handles dragenter/dragover/drop/dragleave on the itemsContainer so it
+	 * works with both normal and virtual-scrolling rendering.
+	 *
+	 * IMPORTANT: Both dragenter and dragover must call e.preventDefault() to
+	 * tell the browser this container accepts drops.  The call must happen
+	 * unconditionally (once we know a drag is active) – if it's gated behind
+	 * finding a card target, the browser denies the drop zone on frames where
+	 * the cursor is between cards or over the dragged card itself.
+	 */
+	private setupContainerDragHandlers(): void {
+		if (!this.itemsContainer) return;
+
+		// dragenter: required by the HTML5 DnD spec alongside dragover to
+		// indicate this container is a valid drop zone.
+		this.itemsContainer.addEventListener("dragenter", (e: DragEvent) => {
+			if (!this.draggedTaskPath) return;
+			e.preventDefault();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+		});
+
+		this.itemsContainer.addEventListener("dragover", (e: DragEvent) => {
+			if (!this.draggedTaskPath) return;
+
+			// Always accept – must be unconditional so the browser keeps
+			// the drop zone active even when the cursor is between cards.
+			e.preventDefault();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+
+			// Throttle visual updates via rAF
+			this.pendingDragClientY = e.clientY;
+			if (!this.dragOverRafId) {
+				this.dragOverRafId = window.requestAnimationFrame(() => {
+					this.dragOverRafId = 0;
+
+					const clientY = this.pendingDragClientY;
+					this.pendingDragClientY = null;
+					if (clientY === null) return;
+
+					this.updateResolvedInsertionSlot(clientY);
+				});
+			}
+		});
+
+		this.itemsContainer.addEventListener("dragleave", (e: DragEvent) => {
+			// Only clear if leaving the container entirely (not moving between children)
+			const related = e.relatedTarget as HTMLElement | null;
+			if (!related || !this.itemsContainer?.contains(related)) {
+				this.clearDropIndicators();
+			}
+		});
+
+		this.itemsContainer.addEventListener("drop", (e: DragEvent) => {
+			void (async () => {
+				e.preventDefault();
+				if (!this.draggedTaskPath) return;
+
+				if (!this.flushPendingInsertionSlot(e.clientY) && this.currentInsertionIndex < 0)
+					return;
+
+				const draggedPath = this.draggedTaskPath;
+				const sourceGroupKey = this.dragGroupKey;
+				const targetGroupKey = this.currentInsertionGroupKey;
+				const targetVisiblePaths = this.getVisibleSortScopePathsForDrag(targetGroupKey);
+				const insertionSegmentIndex = this.currentInsertionSegmentIndex;
+				const insertionIndex = this.currentInsertionIndex;
+				const dropTarget =
+					insertionSegmentIndex >= 0 && insertionIndex >= 0
+						? this.reconstructDropTargetFromInsertionSlot(
+								insertionSegmentIndex,
+								insertionIndex
+							)
+						: null;
+				if (!draggedPath || !dropTarget) return;
+
+				this.clearDropIndicators();
+				this.cleanupDragShift();
+
+				this.draggedTaskPath = null;
+				this.dragGroupKey = null;
+				this.currentInsertionGroupKey = null;
+				this.currentInsertionSegmentIndex = -1;
+				this.currentInsertionIndex = -1;
+				this.pendingDragClientY = null;
+
+				await this.handleSortOrderDrop(
+					draggedPath,
+					dropTarget.taskPath,
+					dropTarget.above,
+					targetGroupKey,
+					sourceGroupKey,
+					targetVisiblePaths
+				);
+			})();
+		});
+	}
+
+	private async handleSortOrderDrop(
+		draggedPath: string,
+		targetPath: string,
+		above: boolean,
+		targetGroupKey: string | null,
+		sourceGroupKey: string | null,
+		targetVisiblePaths?: string[]
+	): Promise<void> {
+		const groupByPropertyId = this.getGroupByPropertyId();
+		const reorderScopeKey = this.getReorderScopeQueueKey(targetGroupKey, groupByPropertyId);
+		await this.dropQueue.enqueue(reorderScopeKey, async () => {
+			const groupDropPlan = buildTaskListGroupDropPlan({
+				groupByPropertyId,
+				sourceGroupKey,
+				targetGroupKey,
+				lookupMappingKey: (propertyName) =>
+					this.plugin.fieldMapper.lookupMappingKey(propertyName),
+				isListTypeProperty: (propertyName) => this.isListTypeProperty(propertyName),
+			});
+
+			if (groupDropPlan.isFormulaGrouping) {
+				new Notice(
+					this.plugin.i18n.translate("views.taskList.errors.formulaGroupingReadOnly")
+				);
+				return;
+			}
+
+			// Compute sort_order first (read-only — no file writes yet)
+			const sortOrderPlan = await prepareSortOrderUpdate(
+				targetPath,
+				above,
+				targetGroupKey,
+				groupDropPlan.cleanGroupBy,
+				draggedPath,
+				this.plugin,
+				{
+					taskInfoCache: this.taskInfoCache,
+					visibleTaskPaths:
+						targetVisiblePaths ?? this.getVisibleSortScopePaths(targetGroupKey),
+					candidateTaskPaths: this.getCandidateSortScopePaths(targetGroupKey),
+				}
+			);
+			if (sortOrderPlan.sortOrder === null) return;
+
+			const totalEditedNotes = sortOrderPlan.additionalWrites.length + 1;
+			if (totalEditedNotes > this.LARGE_REORDER_WARNING_THRESHOLD) {
+				const confirmed = await this.confirmLargeReorder(totalEditedNotes, targetGroupKey);
+				if (!confirmed) return;
+			}
+
+			// Determine if we need to write anything
+			const needsWrite = groupDropPlan.needsGroupUpdate || sortOrderPlan !== null;
+			if (!needsWrite) {
+				this.debouncedRefresh();
+				return;
+			}
+
+			const file = this.plugin.app.vault.getAbstractFileByPath(draggedPath);
+			if (!file || !(file instanceof TFile)) {
+				this.debouncedRefresh();
+				return;
+			}
+
+			const sortOrderField = this.plugin.settings.fieldMapping.sortOrder;
+
+			await applySortOrderPlan(draggedPath, sortOrderPlan, this.plugin, {
+				includeDragged: false,
+			});
+
+			// Single atomic write: group property + sort_order + derivative fields
+			await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+				applyTaskListDropFrontmatterMutation({
+					frontmatter: fm,
+					plan: groupDropPlan,
+					sortOrderField,
+					sortOrder: sortOrderPlan.sortOrder,
+					isRecurring: !!this.taskInfoCache.get(draggedPath)?.recurrence,
+					dateModifiedField: this.plugin.fieldMapper.toUserField("dateModified"),
+					coerceGroupKeyForFrontmatter: (property, groupKey) =>
+						this.coerceGroupKeyForFrontmatter(property, groupKey),
+					updateCompletedDateInFrontmatter: (frontmatter, status, isRecurring) =>
+						this.plugin.taskService.updateCompletedDateInFrontmatter(
+							frontmatter,
+							status,
+							isRecurring
+						),
+					getTimestamp: getCurrentTimestamp,
+				});
+			});
+
+			// Fire post-write side effects for known TaskInfo property changes
+			if (groupDropPlan.needsGroupUpdate && groupDropPlan.groupByTaskProp) {
+				try {
+					const originalTask =
+						this.taskInfoCache.get(draggedPath) ??
+						(await this.plugin.cacheManager.getTaskInfo(draggedPath));
+					if (originalTask) {
+						const updatedTask = buildTaskListDropSideEffectTask(originalTask, {
+							plan: groupDropPlan,
+							isCompletedStatus: (status) =>
+								this.plugin.statusManager.isCompletedStatus(status),
+							getTimestamp: getCurrentTimestamp,
+							getCompletedDate: () => new Date().toISOString().split("T")[0],
+						});
+						if (updatedTask) {
+							await this.plugin.taskService.applyPropertyChangeSideEffects(
+								file,
+								originalTask,
+								updatedTask,
+								groupDropPlan.groupByTaskProp as keyof TaskInfo,
+								groupDropPlan.sourceGroupKey,
+								groupDropPlan.normalizedTargetGroupKey
+							);
+						}
+					}
+				} catch (sideEffectError) {
+					tasknotesLogger.warn(
+						"[TaskNotes][TaskListView] Side-effect error after drop:",
+						{
+							category: "persistence",
+							operation: "side-effect-drop",
+							error: sideEffectError,
+						}
+					);
+				}
+			}
+
+			const didOptimisticallyReorder = this.applyOptimisticSortOrderResult(
+				draggedPath,
+				targetPath,
+				above,
+				targetGroupKey,
+				sourceGroupKey,
+				sortOrderPlan
+			);
+			if (!didOptimisticallyReorder) {
+				this.debouncedRefresh();
+			}
+		});
+	}
+
+	private async renderFlat(taskNotes: TaskInfo[]): Promise<void> {
+		const visibleProperties = this.getVisibleProperties();
+		this.setSortScopeCandidatePaths([[null, taskNotes.map((task) => task.path)]]);
+
+		// Apply search filter
+		const filteredTasks = this.applySearchFilter(taskNotes);
+		this.setExpandedRelationshipTaskScope(filteredTasks);
+		const renderTasks = this.getTopLevelRenderTasks(filteredTasks);
+		this.setCurrentVisibleTaskPaths(renderTasks);
+
+		// Show "no results" if search returned empty but we had tasks
+		if (this.isSearchWithNoResults(filteredTasks, taskNotes.length)) {
+			this.clearAllTaskElements();
+			this.sortScopeTaskPaths.clear();
+			this.sortScopeCandidateTaskPaths.clear();
+			if (this.itemsContainer) {
+				this.renderSearchNoResults(this.itemsContainer);
+			}
+			return;
+		}
+
+		// Note: taskNotes are already sorted by Bases according to sort configuration
+		// No manual sorting needed - Bases provides pre-sorted data
+
+		const targetDate = createUTCDateFromLocalCalendarDate(new Date());
+		this.currentTargetDate = targetDate;
+
+		const cardOptions = this.getCardOptions(targetDate);
+
+		// Decide whether to use virtual scrolling based on filtered task count
+		const shouldUseVirtualScrolling = renderTasks.length >= this.VIRTUAL_SCROLL_THRESHOLD;
+
+		if (shouldUseVirtualScrolling && !this.useVirtualScrolling) {
+			// Switch to virtual scrolling
+			this.cleanupNonVirtualRendering();
+			this.useVirtualScrolling = true;
+		} else if (!shouldUseVirtualScrolling && this.useVirtualScrolling) {
+			// Switch back to normal rendering
+			this.destroyVirtualScroller();
+			this.useVirtualScrolling = false;
+		}
+
+		if (this.useVirtualScrolling) {
+			await this.renderFlatVirtual(renderTasks, visibleProperties, cardOptions);
+		} else {
+			await this.renderFlatNormal(renderTasks, visibleProperties, cardOptions);
+		}
+	}
+
+	private async renderFlatVirtual(
+		taskNotes: TaskInfo[],
+		visibleProperties: string[] | undefined,
+		cardOptions: TaskCardOptions
+	): Promise<void> {
+		if (!this.itemsContainer) return;
+		this.taskGroupKeys.clear(); // No groups in flat mode
+		this.setSortScopePaths([[null, taskNotes.map((task) => task.path)]]);
+
+		if (!this.virtualScroller) {
+			// Initialize virtual scroller with automatic height calculation
+			this.resetVirtualScrollerIfCardRenderChanged(
+				this.buildCardRenderSignature(visibleProperties, cardOptions)
+			);
+			this.virtualScroller = new VirtualScroller<TaskListVirtualItem>({
+				container: this.itemsContainer,
+				items: taskNotes,
+				// itemHeight omitted - will be calculated automatically from sample
+				overscan: 5,
+				renderItem: (item: TaskListVirtualItem) => {
+					if ("type" in item) {
+						throw new Error("Unexpected grouped item in flat renderer");
+					}
+					const taskInfo = item;
+					// Create card using lazy mode
+					const card = createTaskCard(item, this.plugin, visibleProperties, cardOptions);
+
+					// Attach drag handlers for sort_order reordering
+					this.configureCardForManualReordering(card, taskInfo, null);
+
+					// Cache task info for event handlers
+					this.taskInfoCache.set(taskInfo.path, taskInfo);
+					this.lastTaskSignatures.set(taskInfo.path, this.buildTaskSignature(taskInfo));
+
+					return card;
+				},
+				getItemKey: (item) => {
+					if ("type" in item) {
+						return `grouped-${item.groupKey}`;
+					}
+					return item.path;
+				},
+			});
+
+			// Force recalculation after DOM settles
+			window.setTimeout(() => {
+				this.virtualScroller?.recalculate();
+			}, 0);
+		} else {
+			// Update existing virtual scroller with new items
+			this.resetVirtualScrollerIfCardRenderChanged(
+				this.buildCardRenderSignature(visibleProperties, cardOptions)
+			);
+			if (!this.virtualScroller) {
+				await this.renderFlatVirtual(taskNotes, visibleProperties, cardOptions);
+				return;
+			}
+			this.virtualScroller.updateItems(taskNotes);
+		}
+
+		this.lastVirtualItems = taskNotes;
+		this.lastFlatPaths = taskNotes.map((task) => task.path);
+		this.lastCardRenderSignature = this.buildCardRenderSignature(
+			visibleProperties,
+			cardOptions
+		);
+	}
+
+	private async renderFlatNormal(
+		taskNotes: TaskInfo[],
+		visibleProperties: string[] | undefined,
+		cardOptions: TaskCardOptions
+	): Promise<void> {
+		if (!this.itemsContainer) return;
+		this.lastVirtualItems = [];
+		this.taskGroupKeys.clear(); // No groups in flat mode
+		this.setSortScopePaths([[null, taskNotes.map((task) => task.path)]]);
+
+		const seenPaths = new Set<string>();
+		const orderChanged = !this.arePathArraysEqual(taskNotes, this.lastFlatPaths);
+		const cardRenderSignature = this.buildCardRenderSignature(visibleProperties, cardOptions);
+		const cardRenderChanged = cardRenderSignature !== this.lastCardRenderSignature;
+
+		if (orderChanged) {
+			this.itemsContainer.empty();
+			this.currentTaskElements.clear();
+		}
+
+		for (const taskInfo of taskNotes) {
+			let cardEl = orderChanged ? null : this.currentTaskElements.get(taskInfo.path) || null;
+			const signature = this.buildTaskSignature(taskInfo);
+			const previousSignature = this.lastTaskSignatures.get(taskInfo.path);
+			const needsUpdate = cardRenderChanged || signature !== previousSignature || !cardEl;
+
+			if (!cardEl || needsUpdate) {
+				const newCard = createTaskCard(
+					taskInfo,
+					this.plugin,
+					visibleProperties,
+					cardOptions
+				);
+				if (cardEl && cardEl.isConnected) {
+					cardEl.replaceWith(newCard);
+				}
+				cardEl = newCard;
+			}
+
+			if (!cardEl.isConnected) {
+				this.itemsContainer.appendChild(cardEl);
+			}
+
+			if (needsUpdate) {
+				this.configureCardForManualReordering(cardEl, taskInfo, null);
+			}
+
+			this.currentTaskElements.set(taskInfo.path, cardEl);
+			this.taskInfoCache.set(taskInfo.path, taskInfo);
+			this.lastTaskSignatures.set(taskInfo.path, signature);
+			seenPaths.add(taskInfo.path);
+		}
+
+		if (!orderChanged && seenPaths.size !== this.currentTaskElements.size) {
+			for (const [path, el] of this.currentTaskElements) {
+				if (!seenPaths.has(path)) {
+					el.remove();
+					this.currentTaskElements.delete(path);
+
+					// Clean up related state in the same pass
+					const timeout = this.clickTimeouts.get(path);
+					if (timeout) {
+						window.clearTimeout(timeout);
+						this.clickTimeouts.delete(path);
+					}
+					this.taskInfoCache.delete(path);
+					this.lastTaskSignatures.delete(path);
+				}
+			}
+		}
+
+		this.lastFlatPaths = taskNotes.map((task) => task.path);
+		this.lastCardRenderSignature = cardRenderSignature;
+	}
+
+	/**
+	 * Render tasks grouped by sub-property (when no primary grouping is configured).
+	 * This treats the sub-group property as primary grouping.
+	 */
+	private async renderGroupedBySubProperty(taskNotes: TaskInfo[]): Promise<void> {
+		const visibleProperties = this.getVisibleProperties();
+
+		// Apply search filter
+		const filteredTasks = this.applySearchFilter(taskNotes);
+		this.setExpandedRelationshipTaskScope(filteredTasks);
+		const renderTasks = this.getTopLevelRenderTasks(filteredTasks);
+		const candidateTasks = this.getTopLevelRenderTasks(taskNotes);
+		this.setCurrentVisibleTaskPaths(renderTasks);
+
+		// Show "no results" if search returned empty but we had tasks
+		if (this.isSearchWithNoResults(filteredTasks, taskNotes.length)) {
+			this.clearAllTaskElements();
+			this.sortScopeTaskPaths.clear();
+			this.sortScopeCandidateTaskPaths.clear();
+			if (this.itemsContainer) {
+				this.renderSearchNoResults(this.itemsContainer);
+			}
+			return;
+		}
+
+		const targetDate = createUTCDateFromLocalCalendarDate(new Date());
+		this.currentTargetDate = targetDate;
+		const cardOptions = this.getCardOptions(targetDate);
+
+		// Group tasks by sub-property
+		const pathToProps = buildTaskListPathProperties(this.dataAdapter.extractDataItems());
+		const groupedTasks = groupTasksByTaskListSubProperty(
+			renderTasks,
+			this.subGroupPropertyId!,
+			pathToProps
+		);
+		const allGroupedTasks = groupTasksByTaskListSubProperty(
+			candidateTasks,
+			this.subGroupPropertyId!,
+			pathToProps
+		);
+		this.setSortScopeCandidatePaths(buildTaskListSubPropertyScopePaths(allGroupedTasks));
+		this.applyGroupingSnapshot(this.createSubPropertyHierarchySnapshot(groupedTasks));
+
+		// Build flat items array (treat sub-groups as primary groups)
+		const items = buildTaskListSubPropertyRenderItems(groupedTasks, this.collapsedGroups);
+
+		// Decide whether to use virtual scrolling
+		const shouldUseVirtualScrolling = items.length >= this.VIRTUAL_SCROLL_THRESHOLD;
+
+		// Switch rendering mode if needed
+		if (this.useVirtualScrolling && shouldUseVirtualScrolling && this.virtualScroller) {
+			await this.renderGroupedVirtual(items, visibleProperties, cardOptions);
+			this.lastFlatPaths = taskNotes.map((task) => task.path);
+			return;
+		}
+
+		// Full render needed
+		this.itemsContainer!.empty();
+		this.currentTaskElements.clear();
+		this.clearClickTimeouts();
+		this.taskInfoCache.clear();
+		this.lastTaskSignatures.clear();
+
+		if (shouldUseVirtualScrolling && !this.useVirtualScrolling) {
+			this.cleanupNonVirtualRendering();
+			this.useVirtualScrolling = true;
+		} else if (!shouldUseVirtualScrolling && this.useVirtualScrolling) {
+			this.destroyVirtualScroller();
+			this.useVirtualScrolling = false;
+		}
+
+		if (this.useVirtualScrolling) {
+			await this.renderGroupedVirtual(items, visibleProperties, cardOptions);
+		} else {
+			await this.renderGroupedNormal(items, visibleProperties, cardOptions);
+		}
+
+		this.lastFlatPaths = taskNotes.map((task) => task.path);
+	}
+
+	private async renderGrouped(taskNotes: TaskInfo[]): Promise<void> {
+		const visibleProperties = this.getVisibleProperties();
+		const groups = this.dataAdapter.getGroupedData() as TaskListGroup[];
+
+		// Apply search filter
+		const filteredTasks = this.applySearchFilter(taskNotes);
+		this.setExpandedRelationshipTaskScope(filteredTasks);
+		const renderTasks = this.getTopLevelRenderTasks(filteredTasks);
+		const candidateTasks = this.getTopLevelRenderTasks(taskNotes);
+		this.setCurrentVisibleTaskPaths(renderTasks);
+
+		// Show "no results" if search returned empty but we had tasks
+		if (this.isSearchWithNoResults(filteredTasks, taskNotes.length)) {
+			this.clearAllTaskElements();
+			this.sortScopeTaskPaths.clear();
+			this.sortScopeCandidateTaskPaths.clear();
+			if (this.itemsContainer) {
+				this.renderSearchNoResults(this.itemsContainer);
+			}
+			return;
+		}
+
+		const targetDate = createUTCDateFromLocalCalendarDate(new Date());
+		this.currentTargetDate = targetDate;
+		const cardOptions = this.getCardOptions(targetDate);
+		this.applyGroupingSnapshot(this.createGroupedHierarchySnapshot(groups, renderTasks));
+
+		// Build flattened list of items using shared method
+		const pathToProps = this.subGroupPropertyId
+			? buildTaskListPathProperties(this.dataAdapter.extractDataItems())
+			: new Map<string, Record<string, unknown>>();
+		const items = buildTaskListGroupedRenderItems({
+			groups,
+			taskNotes: renderTasks,
+			subGroupPropertyId: this.subGroupPropertyId,
+			pathToProps,
+			collapsedGroups: this.collapsedGroups,
+			collapsedSubGroups: this.collapsedSubGroups,
+			convertGroupKeyToString: (key) => this.dataAdapter.convertGroupKeyToString(key),
+		});
+		this.setSortScopeCandidatePaths(
+			buildTaskListGroupedScopePaths(groups, candidateTasks, (key) =>
+				this.dataAdapter.convertGroupKeyToString(key)
+			)
+		);
+
+		// Use virtual scrolling if we have many items
+		const shouldUseVirtualScrolling = items.length >= this.VIRTUAL_SCROLL_THRESHOLD;
+
+		// If already using virtual scrolling and still need it, just update items
+		if (this.useVirtualScrolling && shouldUseVirtualScrolling && this.virtualScroller) {
+			await this.renderGroupedVirtual(items, visibleProperties, cardOptions);
+			this.lastFlatPaths = taskNotes.map((task) => task.path);
+			return;
+		}
+
+		// Otherwise, need to switch rendering mode or initial render
+		this.itemsContainer!.empty();
+		this.currentTaskElements.clear();
+		this.clearClickTimeouts();
+		this.taskInfoCache.clear();
+		this.lastTaskSignatures.clear();
+
+		if (shouldUseVirtualScrolling && !this.useVirtualScrolling) {
+			this.cleanupNonVirtualRendering();
+			this.useVirtualScrolling = true;
+		} else if (!shouldUseVirtualScrolling && this.useVirtualScrolling) {
+			this.destroyVirtualScroller();
+			this.useVirtualScrolling = false;
+		}
+
+		if (this.useVirtualScrolling) {
+			await this.renderGroupedVirtual(items, visibleProperties, cardOptions);
+		} else {
+			await this.renderGroupedNormal(items, visibleProperties, cardOptions);
+		}
+
+		this.lastFlatPaths = taskNotes.map((task) => task.path);
+	}
+
+	private async renderGroupedVirtual(
+		items: TaskListRenderItem[],
+		visibleProperties: string[] | undefined,
+		cardOptions: TaskCardOptions
+	): Promise<void> {
+		// Populate group key lookup for cross-group drag detection
+		this.syncGroupedDragMetadata(items);
+
+		if (!this.virtualScroller) {
+			this.virtualScroller = new VirtualScroller<TaskListVirtualItem>({
+				container: this.itemsContainer!,
+				items: items,
+				// itemHeight omitted - automatically calculated from sample (headers + cards)
+				overscan: 5,
+				renderItem: (item) => {
+					if (!("type" in item)) {
+						throw new Error("Unexpected flat task item in grouped renderer");
+					}
+					if (item.type === "primary-header" || item.type === "sub-header") {
+						return this.createGroupHeader(item);
+					} else {
+						const cardEl = createTaskCard(
+							item.task,
+							this.plugin,
+							visibleProperties,
+							cardOptions
+						);
+						// Attach drag handlers for sort_order reordering
+						this.configureCardForManualReordering(cardEl, item.task, item.groupKey);
+						this.taskInfoCache.set(item.task.path, item.task);
+						this.lastTaskSignatures.set(
+							item.task.path,
+							this.buildTaskSignature(item.task)
+						);
+						return cardEl;
+					}
+				},
+				getItemKey: (item) => {
+					if (!("type" in item)) {
+						return item.path;
+					}
+					if (item.type === "primary-header") {
+						return `primary-${item.groupKey}`;
+					} else if (item.type === "sub-header") {
+						return `sub-${item.groupKey}:${item.subGroupKey}`;
+					} else {
+						return item.task.path;
+					}
+				},
+			});
+
+			window.setTimeout(() => {
+				this.virtualScroller?.recalculate();
+			}, 0);
+		} else {
+			this.resetVirtualScrollerIfCardRenderChanged(
+				this.buildCardRenderSignature(visibleProperties, cardOptions)
+			);
+			if (!this.virtualScroller) {
+				await this.renderGroupedVirtual(items, visibleProperties, cardOptions);
+				return;
+			}
+			this.virtualScroller.updateItems(items);
+		}
+		this.lastVirtualItems = items;
+		this.lastCardRenderSignature = this.buildCardRenderSignature(
+			visibleProperties,
+			cardOptions
+		);
+	}
+
+	private async renderGroupedNormal(
+		items: TaskListRenderItem[],
+		visibleProperties: string[] | undefined,
+		cardOptions: TaskCardOptions
+	): Promise<void> {
+		this.lastVirtualItems = [];
+		// Populate group key lookup for cross-group drag detection
+		this.syncGroupedDragMetadata(items);
+
+		for (const item of items) {
+			if (item.type === "primary-header" || item.type === "sub-header") {
+				const headerEl = this.createGroupHeader(item);
+				this.itemsContainer!.appendChild(headerEl);
+			} else {
+				const cardEl = createTaskCard(
+					item.task,
+					this.plugin,
+					visibleProperties,
+					cardOptions
+				);
+				this.configureCardForManualReordering(cardEl, item.task, item.groupKey);
+				this.itemsContainer!.appendChild(cardEl);
+				this.currentTaskElements.set(item.task.path, cardEl);
+				this.taskInfoCache.set(item.task.path, item.task);
+				this.lastTaskSignatures.set(item.task.path, this.buildTaskSignature(item.task));
+			}
+		}
+		this.lastCardRenderSignature = this.buildCardRenderSignature(
+			visibleProperties,
+			cardOptions
+		);
+	}
+
+	private createGroupHeader(headerItem: TaskListHeaderItem): HTMLElement {
+		// Use correct document for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+
+		const groupHeader = doc.createElement("div");
+		groupHeader.className = "task-section task-group";
+
+		// Determine header level and set appropriate data attributes
+		const isSubHeader = headerItem.type === "sub-header";
+		const level = isSubHeader ? "sub" : "primary";
+		groupHeader.dataset.level = level;
+		const groupKey = isSubHeader
+			? `${headerItem.groupKey}:${headerItem.subGroupKey}`
+			: headerItem.groupKey;
+
+		if (isSubHeader) {
+			groupHeader.dataset.groupKey = groupKey;
+			groupHeader.dataset.parentKey = headerItem.parentKey;
+		} else {
+			groupHeader.dataset.groupKey = groupKey;
+		}
+
+		// Apply collapsed state
+		if (headerItem.isCollapsed) {
+			groupHeader.classList.add("is-collapsed");
+		}
+
+		const headerElement = doc.createElement("h3");
+		headerElement.className = "task-group-header task-list-view__group-header";
+		groupHeader.appendChild(headerElement);
+
+		// Add toggle button
+		const toggleBtn = doc.createElement("button");
+		toggleBtn.className = "task-group-toggle";
+		toggleBtn.type = "button";
+		toggleBtn.setAttribute("aria-label", "Toggle group");
+		toggleBtn.setAttribute("aria-expanded", String(!headerItem.isCollapsed));
+		toggleBtn.dataset.groupKey = groupKey;
+		headerElement.appendChild(toggleBtn);
+
+		// Add chevron icon
+		setIcon(toggleBtn, "chevron-right");
+		const svg = toggleBtn.querySelector("svg");
+		if (svg) {
+			svg.classList.add("chevron");
+			svg.setAttribute("width", "16");
+			svg.setAttribute("height", "16");
+		}
+
+		// Add group title
+		const titleContainer = headerElement.createSpan({ cls: "task-group-title" });
+		const displayTitle = isSubHeader ? headerItem.subGroupTitle : headerItem.groupTitle;
+		this.renderGroupTitle(titleContainer, displayTitle);
+
+		// Add count
+		headerElement.createSpan({
+			text: ` (${headerItem.taskCount})`,
+			cls: "agenda-view__item-count",
+		});
+
+		return groupHeader;
+	}
+
+	protected async handleTaskUpdate(task: TaskInfo): Promise<void> {
+		// Update cache
+		this.taskInfoCache.set(task.path, task);
+		this.lastTaskSignatures.set(task.path, this.buildTaskSignature(task));
+
+		// For virtual scrolling, just do a full refresh
+		// Simple and reliable, performance is still good with virtual scrolling
+		if (this.useVirtualScrolling) {
+			this.debouncedRefresh();
+		} else {
+			// Normal mode - update the specific card
+			const existingElement = this.currentTaskElements.get(task.path);
+			if (existingElement && existingElement.isConnected) {
+				const visibleProperties = this.getVisibleProperties();
+				const replacement = createTaskCard(
+					task,
+					this.plugin,
+					visibleProperties,
+					this.getCardOptions(this.currentTargetDate)
+				);
+				this.configureCardForManualReordering(
+					replacement,
+					task,
+					this.taskGroupKeys.get(task.path) ?? null
+				);
+				existingElement.replaceWith(replacement);
+				replacement.classList.add("task-card--updated");
+				// Use correct window for pop-out window support
+				const win = this.containerEl.ownerDocument.defaultView || window;
+				win.setTimeout(() => {
+					replacement.classList.remove("task-card--updated");
+				}, 1000);
+				this.currentTaskElements.set(task.path, replacement);
+			} else {
+				this.debouncedRefresh();
+			}
+		}
+	}
+
+	private renderEmptyState(): void {
+		// Use correct document for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const emptyEl = doc.createElement("div");
+		emptyEl.className = "tn-bases-empty";
+		emptyEl.classList.remove(
+			"tn-static-color-var-color-accent-d2cad743",
+			"tn-static-color-var-text-accent-65b47ee3",
+			"tn-static-color-var-text-muted-5872de20",
+			"tn-static-color-var-text-on-accent-f3e1679d",
+			"tn-static-color-var-text-warning-783d5f03",
+			"tn-static-color-var-tn-text-muted-a90fb6f3",
+			"tn-static-color-white-0a43e56a",
+			"tn-static-cursor-pointer-2723efcc",
+			"tn-static-font-size-12px-65574819",
+			"tn-static-font-weight-bold-0fe8c30d",
+			"tn-static-font-weight-bold-e0b452bd",
+			"tn-static-margin-2px-0-edce9b14",
+			"tn-static-margin-8px-0-0-0-a2eb8382",
+			"tn-static-padding-0-16px-16px-16px-f1aa998c",
+			"tn-static-padding-0-41d7d7e2",
+			"tn-static-padding-12px-43bef435",
+			"tn-static-padding-16px-287f770e",
+			"tn-static-padding-20px-769fed37",
+			"tn-static-padding-20px-ebe8e48c",
+			"tn-static-padding-2px-8px-c8eea84a",
+			"tn-static-padding-2rem-42aa6d9c",
+			"tn-static-text-align-center-91a87015"
+		);
+		emptyEl.classList.add("tn-static-padding-20px-7a035d95");
+		emptyEl.textContent = "No tasknotes tasks found for this base.";
+		this.itemsContainer!.appendChild(emptyEl);
+	}
+
+	renderError(error: Error): void {
+		// Use correct document for pop-out window support
+		const doc = this.containerEl.ownerDocument;
+		const errorEl = doc.createElement("div");
+		errorEl.className = "tn-bases-error";
+		errorEl.classList.remove(
+			"tn-static-border-radius-4px-c290c56e",
+			"tn-static-border-radius-6px-0dc8408c",
+			"tn-static-color-var-color-accent-d2cad743",
+			"tn-static-color-var-text-accent-65b47ee3",
+			"tn-static-color-var-text-muted-5872de20",
+			"tn-static-color-var-text-on-accent-f3e1679d",
+			"tn-static-color-var-text-warning-783d5f03",
+			"tn-static-color-var-tn-text-muted-a90fb6f3",
+			"tn-static-color-white-0a43e56a",
+			"tn-static-cursor-pointer-2723efcc",
+			"tn-static-font-size-12px-65574819",
+			"tn-static-font-weight-bold-0fe8c30d",
+			"tn-static-font-weight-bold-e0b452bd",
+			"tn-static-margin-0-11696618",
+			"tn-static-margin-0-auto-266e9b04",
+			"tn-static-margin-0-db0d5f36",
+			"tn-static-margin-0-var-size-4-2-77f7dc08",
+			"tn-static-margin-2px-0-edce9b14",
+			"tn-static-margin-8px-0-0-0-a2eb8382",
+			"tn-static-padding-0-16px-16px-16px-f1aa998c",
+			"tn-static-padding-0-41d7d7e2",
+			"tn-static-padding-12px-43bef435",
+			"tn-static-padding-16px-287f770e",
+			"tn-static-padding-20px-769fed37",
+			"tn-static-padding-20px-7a035d95",
+			"tn-static-padding-2px-8px-c8eea84a",
+			"tn-static-padding-2rem-42aa6d9c"
+		);
+		errorEl.classList.add("tn-static-padding-20px-ebe8e48c");
+		errorEl.textContent = `Error loading tasks: ${error.message || "Unknown error"}`;
+		this.itemsContainer!.appendChild(errorEl);
+	}
+
+	/**
+	 * Render group title using shared utility.
+	 * Uses this.app from BasesView (with fallback to plugin.app for safety).
+	 */
+	private renderGroupTitle(container: HTMLElement, title: string): void {
+		// Use this.app if available (set by Bases), otherwise fall back to plugin.app
+		const app = this.app || this.plugin.app;
+
+		const linkServices: LinkServices = {
+			metadataCache: app.metadataCache,
+			workspace: app.workspace,
+		};
+
+		renderGroupTitle(container, title, linkServices);
+	}
+
+	/**
+	 * Component lifecycle: Called when component is unloaded.
+	 * Override from Component base class.
+	 */
+	onunload(): void {
+		// Component.register() calls will be automatically cleaned up (including search cleanup)
+		// We just need to clean up view-specific state
+		this.unregisterContainerListeners();
+		this.destroyVirtualScroller();
+
+		this.currentTaskElements.clear();
+		this.itemsContainer = null;
+		this.lastRenderWasGrouped = false;
+		this.clearClickTimeouts();
+		this.taskInfoCache.clear();
+		this.lastTaskSignatures.clear();
+		this.lastFlatPaths = [];
+		this.useVirtualScrolling = false;
+		this.collapsedGroups.clear();
+		this.collapsedSubGroups.clear();
+		this.clearGroupingSnapshot();
+		this.initializedPrimaryGroupKeys.clear();
+		this.initializedSubGroupKeys.clear();
+		this.taskGroupKeys.clear();
+		this.sortScopeTaskPaths.clear();
+	}
+
+	/**
+	 * Get ephemeral state to preserve across view reloads.
+	 * Saves scroll position, collapsed groups, and collapsed sub-groups.
+	 */
+	getEphemeralState(): unknown {
+		const baseState = super.getEphemeralState();
+		const baseStateObject = isRecord(baseState) ? baseState : {};
+
+		return {
+			...baseStateObject,
+			scrollTop: this.rootElement?.scrollTop || 0,
+			collapsedGroups: Array.from(this.collapsedGroups),
+			collapsedSubGroups: Array.from(this.collapsedSubGroups),
+		};
+	}
+
+	/**
+	 * Restore ephemeral state after view reload.
+	 * Restores scroll position, collapsed groups, and collapsed sub-groups.
+	 */
+	setEphemeralState(state: unknown): void {
+		if (!isTaskListEphemeralState(state)) return;
+		super.setEphemeralState(state);
+
+		let restoredCollapsedState = false;
+
+		// Restore collapsed groups immediately
+		if (state.collapsedGroups && Array.isArray(state.collapsedGroups)) {
+			const filtered = state.collapsedGroups.filter(
+				(value): value is string => typeof value === "string"
+			);
+			this.collapsedGroups = new Set(filtered);
+			restoredCollapsedState = restoredCollapsedState || filtered.length > 0;
+		}
+
+		// Restore collapsed sub-groups immediately
+		if (state.collapsedSubGroups && Array.isArray(state.collapsedSubGroups)) {
+			const filtered = state.collapsedSubGroups.filter(
+				(value): value is string => typeof value === "string"
+			);
+			this.collapsedSubGroups = new Set(filtered);
+			restoredCollapsedState = restoredCollapsedState || filtered.length > 0;
+		}
+		this.deferCollapseDefaultForNextSnapshot = restoredCollapsedState;
+
+		// Restore scroll position after render completes
+		if (typeof state.scrollTop === "number" && this.rootElement) {
+			const scrollTop = state.scrollTop;
+			// Use requestAnimationFrame to ensure DOM is ready
+			window.requestAnimationFrame(() => {
+				if (this.rootElement && this.rootElement.isConnected) {
+					this.rootElement.scrollTop = scrollTop;
+				}
+			});
+		}
+	}
+
+	private clearAllTaskElements(): void {
+		if (this.useVirtualScrolling) {
+			this.destroyVirtualScroller();
+			this.useVirtualScrolling = false;
+		}
+		this.itemsContainer?.empty();
+		this.currentTaskElements.forEach((el) => el.remove());
+		this.currentTaskElements.clear();
+		this.lastFlatPaths = [];
+		this.lastTaskSignatures.clear();
+		this.taskInfoCache.clear();
+		this.clearClickTimeouts();
+		this.taskGroupKeys.clear();
+		this.sortScopeTaskPaths.clear();
+		this.expandedRelationshipTaskPaths.clear();
+		this.expandedRelationshipTaskOrder.clear();
+	}
+
+	private getCardOptions(targetDate: Date): TaskCardOptions {
+		return this.buildTaskCardOptions({
+			targetDate,
+			expandedRelationshipFilterMode: this.expandedRelationshipFilterMode,
+			resolveExpandedRelationshipFilterMode: (): "inherit" | "show-all" =>
+				normalizeExpandedRelationshipFilterMode(
+					this.config?.get("expandedRelationshipFilterMode")
+				),
+			expandedRelationshipTaskPaths: this.expandedRelationshipTaskPaths,
+			expandedRelationshipTaskOrder: this.expandedRelationshipTaskOrder,
+		});
+	}
+
+	private getTopLevelRenderTasks(tasks: readonly TaskInfo[]): TaskInfo[] {
+		return this.hideTopLevelSubtasks ? this.filterTopLevelSubtasks(tasks) : [...tasks];
+	}
+
+	private setExpandedRelationshipTaskScope(tasks: readonly TaskInfo[]): void {
+		this.expandedRelationshipTaskPaths.clear();
+		this.expandedRelationshipTaskOrder.clear();
+		tasks.forEach((task, index) => {
+			this.expandedRelationshipTaskPaths.add(task.path);
+			this.expandedRelationshipTaskOrder.set(task.path, index);
+		});
+	}
+
+	private setCurrentVisibleTaskPaths(tasks: TaskInfo[]): void {
+		this.currentVisibleTaskPaths.clear();
+		this.currentVisibleTaskOrder.clear();
+		tasks.forEach((task, index) => {
+			this.currentVisibleTaskPaths.add(task.path);
+			this.currentVisibleTaskOrder.set(task.path, index);
+		});
+	}
+
+	private clearClickTimeouts(): void {
+		for (const timeout of this.clickTimeouts.values()) {
+			if (timeout) {
+				window.clearTimeout(timeout);
+			}
+		}
+		this.clickTimeouts.clear();
+	}
+
+	private registerContainerListeners(): void {
+		if (!this.itemsContainer || this.containerListenersRegistered) return;
+
+		// Register click listener for group header collapse/expand using Component API
+		// This automatically cleans up on component unload
+		this.registerDomEvent(this.itemsContainer, "click", this.handleItemClick);
+		this.containerListenersRegistered = true;
+	}
+
+	private unregisterContainerListeners(): void {
+		// No manual cleanup needed - Component.registerDomEvent handles it automatically
+		this.containerListenersRegistered = false;
+	}
+
+	private getTaskContextFromEvent(event: Event): { task: TaskInfo; card: HTMLElement } | null {
+		const target = event.target as HTMLElement | null;
+		if (!target) return null;
+		const card = target.closest<HTMLElement>(".task-card");
+		if (!card) return null;
+		const path = card.dataset.taskPath;
+		if (!path) return null;
+		const task = this.taskInfoCache.get(path);
+		if (!task) return null;
+		return { task, card };
+	}
+
+	private handleItemClick = async (event: MouseEvent) => {
+		const target = event.target as HTMLElement;
+
+		// ONLY handle group header clicks - task cards handle their own clicks
+		const groupHeader = target.closest<HTMLElement>(".task-group-header");
+		if (groupHeader) {
+			const groupSection = groupHeader.closest<HTMLElement>(".task-group");
+			const groupKey = groupSection?.dataset.groupKey;
+
+			if (groupKey) {
+				// Don't toggle if clicking on a link
+				if (target.closest("a")) {
+					return;
+				}
+
+				event.preventDefault();
+				event.stopPropagation();
+				await this.handleGroupToggle(groupKey);
+				return;
+			}
+		}
+
+		// Don't handle task card clicks here - they have their own handlers
+		// This prevents double-firing when clicking on tasks
+	};
+
+	private isSubGroupKey(groupKey: string): boolean {
+		return groupKey.includes(":");
+	}
+
+	private setSetEntry(set: Set<string>, key: string, collapsed: boolean): void {
+		if (collapsed) {
+			set.add(key);
+			return;
+		}
+
+		set.delete(key);
+	}
+
+	private getCurrentSubGroupKeys(): string[] {
+		const keys: string[] = [];
+		for (const subGroupKeys of this.currentSubGroupKeysByParent.values()) {
+			keys.push(...subGroupKeys);
+		}
+		return keys;
+	}
+
+	/**
+	 * Set collapsed state for all subgroups within a specific primary group,
+	 * without affecting the primary group itself.
+	 */
+	private async setSubGroupsCollapsed(groupKey: string, collapsed: boolean): Promise<void> {
+		for (const subGroupKey of this.currentSubGroupKeysByParent.get(groupKey) || []) {
+			this.setSetEntry(this.collapsedSubGroups, subGroupKey, collapsed);
+		}
+
+		if (this.lastRenderWasGrouped) {
+			await this.refreshGroupedView();
+		}
+	}
+
+	/**
+	 * Set collapsed state for all primary groups,
+	 * without affecting subgroups.
+	 */
+	private async setAllPrimaryGroupsCollapsed(collapsed: boolean): Promise<void> {
+		for (const groupKey of this.currentPrimaryGroupKeys) {
+			this.setSetEntry(this.collapsedGroups, groupKey, collapsed);
+		}
+
+		if (this.lastRenderWasGrouped) {
+			await this.refreshGroupedView();
+		}
+	}
+
+	/**
+	 * Set collapsed state for all primary groups and all subgroups.
+	 */
+	private async setAllGroupsAndSubGroupsCollapsed(collapsed: boolean): Promise<void> {
+		for (const groupKey of this.currentPrimaryGroupKeys) {
+			this.setSetEntry(this.collapsedGroups, groupKey, collapsed);
+		}
+		for (const subGroupKey of this.getCurrentSubGroupKeys()) {
+			this.setSetEntry(this.collapsedSubGroups, subGroupKey, collapsed);
+		}
+
+		if (this.lastRenderWasGrouped) {
+			await this.refreshGroupedView();
+		}
+	}
+
+	private async handleGroupToggle(groupKey: string): Promise<void> {
+		if (this.isSubGroupKey(groupKey)) {
+			this.setSetEntry(this.collapsedSubGroups, groupKey, !this.collapsedSubGroups.has(groupKey));
+		} else {
+			this.setSetEntry(this.collapsedGroups, groupKey, !this.collapsedGroups.has(groupKey));
+		}
+
+		// Rebuild items and update virtual scroller without full re-render
+		if (this.lastRenderWasGrouped) {
+			await this.refreshGroupedView();
+		}
+	}
+
+	private async refreshGroupedView(): Promise<void> {
+		if (!this.data?.data) return;
+
+		const dataItems = this.dataAdapter.extractDataItems();
+		computeBasesFormulas(this.data, dataItems);
+		const taskNotes = await identifyTaskNotesFromBasesData(dataItems, this.plugin);
+		const filteredTasks = this.applySearchFilter(taskNotes);
+		this.setExpandedRelationshipTaskScope(filteredTasks);
+		const renderTasks = this.getTopLevelRenderTasks(filteredTasks);
+		this.setCurrentVisibleTaskPaths(renderTasks);
+
+		const pathToProps = this.subGroupPropertyId
+			? buildTaskListPathProperties(dataItems)
+			: new Map<string, Record<string, unknown>>();
+		let items: TaskListRenderItem[];
+
+		if (!this.dataAdapter.isGrouped() && this.subGroupPropertyId) {
+			const groupedTasks = groupTasksByTaskListSubProperty(
+				renderTasks,
+				this.subGroupPropertyId,
+				pathToProps
+			);
+			this.applyGroupingSnapshot(this.createSubPropertyHierarchySnapshot(groupedTasks));
+			items = buildTaskListSubPropertyRenderItems(groupedTasks, this.collapsedGroups);
+		} else {
+			const groups = this.dataAdapter.getGroupedData() as TaskListGroup[];
+			this.applyGroupingSnapshot(this.createGroupedHierarchySnapshot(groups, renderTasks));
+			items = buildTaskListGroupedRenderItems({
+				groups,
+				taskNotes: renderTasks,
+				subGroupPropertyId: this.subGroupPropertyId,
+				pathToProps,
+				collapsedGroups: this.collapsedGroups,
+				collapsedSubGroups: this.collapsedSubGroups,
+				convertGroupKeyToString: (key) =>
+					this.dataAdapter.convertGroupKeyToString(key),
+			});
+		}
+
+		// Update virtual scroller with new items
+		if (this.useVirtualScrolling && this.virtualScroller) {
+			this.syncGroupedDragMetadata(items);
+			this.virtualScroller.updateItems(items);
+		} else {
+			// If not using virtual scrolling, do full render
+			await this.render();
+		}
+	}
+
+	private handleItemContextMenu = async (event: MouseEvent) => {
+		const context = this.getTaskContextFromEvent(event);
+		if (!context) return;
+		event.preventDefault();
+		event.stopPropagation();
+
+		// If multiple tasks are selected, show batch context menu
+		const selectionService = this.plugin.taskSelectionService;
+		if (selectionService && selectionService.getSelectionCount() > 1) {
+			// Ensure the right-clicked task is in the selection
+			if (!selectionService.isSelected(context.task.path)) {
+				selectionService.addToSelection(context.task.path);
+			}
+			this.showBatchContextMenu(event);
+			return;
+		}
+
+		await showTaskContextMenu(event, context.task.path, this.plugin, this.currentTargetDate);
+	};
+
+	private handleItemPointerOver = (event: PointerEvent) => {
+		if ("pointerType" in event && event.pointerType !== "mouse") {
+			return;
+		}
+		const context = this.getTaskContextFromEvent(event);
+		if (!context) return;
+
+		const related = event.relatedTarget as HTMLElement | null;
+		if (related && context.card.contains(related)) {
+			return;
+		}
+
+		const app = this.app || this.plugin.app;
+		const file = app.vault.getAbstractFileByPath(context.task.path);
+		if (file) {
+			app.workspace.trigger("hover-link", {
+				event: event as MouseEvent,
+				source: "tasknotes-task-card",
+				hoverParent: context.card,
+				targetEl: context.card,
+				linktext: context.task.path,
+				sourcePath: context.task.path,
+			});
+		}
+	};
+
+	private async handleActionClick(
+		action: string,
+		task: TaskInfo,
+		target: HTMLElement,
+		event: MouseEvent
+	): Promise<void> {
+		switch (action) {
+			case "toggle-status":
+				await this.handleToggleStatus(task, event);
+				return;
+			case "priority-menu":
+				this.showPriorityMenu(task, event);
+				return;
+			case "recurrence-menu":
+				this.showRecurrenceMenu(task, event);
+				return;
+			case "reminder-menu":
+				this.showReminderModal(task);
+				return;
+			case "task-context-menu":
+				await showTaskContextMenu(
+					event,
+					task.path,
+					this.plugin,
+					this.getTaskActionDate(task)
+				);
+				return;
+			case "edit-date":
+				await this.openDateContextMenu(
+					task,
+					target.dataset.tnDateType as "due" | "scheduled" | undefined,
+					event
+				);
+				return;
+			case "filter-project-subtasks":
+				await this.filterProjectSubtasks(task);
+				return;
+			case "toggle-subtasks":
+				await this.toggleSubtasks(task, target);
+				return;
+			case "toggle-blocking-tasks":
+				await this.toggleBlockingTasks(task, target);
+				return;
+			default:
+				await this.handleCardClick(task, event);
+		}
+	}
+
+	private async handleToggleStatus(task: TaskInfo, event: MouseEvent): Promise<void> {
+		try {
+			if (task.recurrence) {
+				const actionDate = this.getTaskActionDate(task);
+				await this.plugin.toggleRecurringTaskComplete(task, actionDate);
+			} else {
+				await this.plugin.toggleTaskStatus(task);
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			tasknotesLogger.error("[TaskNotes][TaskListView] Failed to toggle status", {
+				category: "persistence",
+				operation: "toggle-status",
+				details: { taskPath: task.path },
+				error: message,
+			});
+			new Notice(`Failed to toggle task status: ${message}`);
+		}
+	}
+
+	/**
+	 * Determine the date to use when completing a recurring task from Bases.
+	 * Prefers the task's scheduled (or due) date to avoid marking the wrong instance.
+	 */
+	private getTaskActionDate(task: TaskInfo): Date {
+		const dateStr = getDatePart(task.scheduled || task.due || "");
+		if (dateStr) {
+			return parseDateToUTC(dateStr);
+		}
+
+		return this.currentTargetDate;
+	}
+
+	private showPriorityMenu(task: TaskInfo, event: MouseEvent): void {
+		const menu = new PriorityContextMenu({
+			currentValue: task.priority,
+			onSelect: (newPriority) => {
+				void (async () => {
+					try {
+						await this.plugin.updateTaskProperty(task, "priority", newPriority);
+					} catch (error) {
+						tasknotesLogger.error(
+							"[TaskNotes][TaskListView] Failed to update priority",
+							{ category: "validation", operation: "update-priority", error: error }
+						);
+						new Notice("Failed to update priority");
+					}
+				})();
+			},
+			plugin: this.plugin,
+		});
+		menu.show(event);
+	}
+
+	private showRecurrenceMenu(task: TaskInfo, event: MouseEvent): void {
+		const menu = new RecurrenceContextMenu({
+			currentValue: typeof task.recurrence === "string" ? task.recurrence : undefined,
+			currentAnchor: task.recurrence_anchor || "scheduled",
+			scheduledDate: task.scheduled,
+			onSelect: (newRecurrence: string | null, anchor?: "scheduled" | "completion") => {
+				void (async () => {
+					try {
+						await this.plugin.updateTaskProperty(
+							task,
+							"recurrence",
+							newRecurrence || undefined
+						);
+						if (anchor !== undefined) {
+							await this.plugin.updateTaskProperty(task, "recurrence_anchor", anchor);
+						}
+					} catch (error) {
+						tasknotesLogger.error(
+							"[TaskNotes][TaskListView] Failed to update recurrence",
+							{ category: "validation", operation: "update-recurrence", error: error }
+						);
+						new Notice("Failed to update recurrence");
+					}
+				})();
+			},
+			app: this.plugin.app,
+			plugin: this.plugin,
+		});
+		menu.show(event);
+	}
+
+	private showReminderModal(task: TaskInfo): void {
+		const modal = new ReminderModal(this.plugin.app, this.plugin, task, (reminders) => {
+			void (async () => {
+				try {
+					await this.plugin.updateTaskProperty(
+						task,
+						"reminders",
+						reminders.length > 0 ? reminders : undefined
+					);
+				} catch (error) {
+					tasknotesLogger.error("[TaskNotes][TaskListView] Failed to update reminders", {
+						category: "validation",
+						operation: "update-reminders",
+						error: error,
+					});
+					new Notice("Failed to update reminders");
+				}
+			})();
+		});
+		modal.open();
+	}
+
+	private async openDateContextMenu(
+		task: TaskInfo,
+		dateType: "due" | "scheduled" | undefined,
+		event: MouseEvent
+	): Promise<void> {
+		if (!dateType) return;
+		const currentValue = dateType === "due" ? task.due : task.scheduled;
+		const menu = new DateContextMenu({
+			currentValue: getDatePart(currentValue || ""),
+			currentTime: getTimePart(currentValue || ""),
+			onSelect: (dateValue, timeValue) => {
+				void (async () => {
+					try {
+						let finalValue: string | undefined;
+						if (!dateValue) {
+							finalValue = undefined;
+						} else if (timeValue) {
+							finalValue = `${dateValue}T${timeValue}`;
+						} else {
+							finalValue = dateValue;
+						}
+						await this.plugin.updateTaskProperty(task, dateType, finalValue);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						tasknotesLogger.error("[TaskNotes][TaskListView] Failed to update date", {
+							category: "validation",
+							operation: "update-date",
+							details: { taskPath: task.path, dateType },
+							error: message,
+						});
+						new Notice(`Failed to update ${dateType} date: ${message}`);
+					}
+				})();
+			},
+			dateRole: dateType,
+			plugin: this.plugin,
+			app: this.app || this.plugin.app,
+		});
+		menu.show(event);
+	}
+
+	private async handleCardClick(task: TaskInfo, event: MouseEvent): Promise<void> {
+		// Check if this is a selection click (shift/ctrl/cmd or in selection mode)
+		if (this.handleSelectionClick(event, task.path)) {
+			return;
+		}
+
+		if (this.plugin.settings.doubleClickAction === "none") {
+			await this.executeSingleClickAction(task, event);
+			return;
+		}
+
+		const existingTimeout = this.clickTimeouts.get(task.path);
+		if (existingTimeout) {
+			window.clearTimeout(existingTimeout);
+			this.clickTimeouts.delete(task.path);
+			await this.executeDoubleClickAction(task, event);
+		} else {
+			// Use correct window for pop-out window support
+			const win = this.containerEl.ownerDocument.defaultView || window;
+			const timeout = win.setTimeout(() => {
+				void (async () => {
+					this.clickTimeouts.delete(task.path);
+					await this.executeSingleClickAction(task, event);
+				})();
+			}, 250);
+			this.clickTimeouts.set(task.path, timeout);
+		}
+	}
+
+	private async executeSingleClickAction(task: TaskInfo, event: MouseEvent): Promise<void> {
+		if (event.ctrlKey || event.metaKey) {
+			this.openTaskNote(task, true);
+			return;
+		}
+
+		switch (this.plugin.settings.singleClickAction) {
+			case "edit":
+				await this.editTask(task);
+				break;
+			case "openNote":
+				this.openTaskNote(task, false);
+				break;
+			default:
+				break;
+		}
+	}
+
+	private async executeDoubleClickAction(task: TaskInfo, event: MouseEvent): Promise<void> {
+		switch (this.plugin.settings.doubleClickAction) {
+			case "edit":
+				await this.editTask(task);
+				break;
+			case "openNote":
+				this.openTaskNote(task, false);
+				break;
+			default:
+				break;
+		}
+	}
+
+	private async editTask(task: TaskInfo): Promise<void> {
+		await this.plugin.openTaskEditModal(task);
+	}
+
+	private openTaskNote(task: TaskInfo, newTab: boolean): void {
+		const app = this.app || this.plugin.app;
+		const file = app.vault.getAbstractFileByPath(task.path);
+		if (file instanceof TFile) {
+			if (newTab) {
+				void app.workspace.openLinkText(task.path, "", true);
+			} else {
+				void app.workspace.getLeaf(false).openFile(file);
+			}
+		}
+	}
+
+	private async filterProjectSubtasks(task: TaskInfo): Promise<void> {
+		try {
+			await this.plugin.applyProjectSubtaskFilter(task);
+		} catch (error) {
+			tasknotesLogger.error("[TaskNotes][TaskListView] Failed to filter project subtasks", {
+				category: "persistence",
+				operation: "filter-project-subtasks",
+				error: error,
+			});
+			new Notice("Failed to filter project subtasks");
+		}
+	}
+
+	private async toggleSubtasks(task: TaskInfo, target: HTMLElement): Promise<void> {
+		try {
+			if (!this.plugin.expandedProjectsService) {
+				tasknotesLogger.error(
+					"[TaskNotes][TaskListView] ExpandedProjectsService not initialized",
+					{ category: "stale-data", operation: "expandedprojectsservice-not-initialized" }
+				);
+				new Notice("Service not available. Please try reloading the plugin.");
+				return;
+			}
+
+			const newExpanded = this.plugin.expandedProjectsService.toggle(
+				task.path,
+				this.plugin.settings?.expandSubtasksByDefault === true
+			);
+			target.classList.toggle("task-card__chevron--expanded", newExpanded);
+			target.setAttribute(
+				"aria-label",
+				newExpanded ? "Collapse subtasks" : "Expand subtasks"
+			);
+
+			// Find the card element and toggle subtasks display
+			const card = target.closest<HTMLElement>(".task-card");
+			if (card) {
+				const { toggleSubtasks } = await import("../ui/TaskCard");
+				await toggleSubtasks(card, task, this.plugin, newExpanded);
+			}
+		} catch (error) {
+			tasknotesLogger.error("[TaskNotes][TaskListView] Failed to toggle subtasks", {
+				category: "persistence",
+				operation: "toggle-subtasks",
+				error: error,
+			});
+			new Notice("Failed to toggle subtasks");
+		}
+	}
+
+	private async toggleBlockingTasks(task: TaskInfo, target: HTMLElement): Promise<void> {
+		try {
+			const expanded = target.classList.toggle("task-card__blocking-toggle--expanded");
+
+			// Find the card element and toggle blocking tasks display
+			const card = target.closest<HTMLElement>(".task-card");
+			if (card) {
+				const { toggleBlockingTasks } = await import("../ui/TaskCard");
+				await toggleBlockingTasks(card, task, this.plugin, expanded);
+			}
+		} catch (error) {
+			tasknotesLogger.error("[TaskNotes][TaskListView] Failed to toggle blocking tasks", {
+				category: "persistence",
+				operation: "toggle-blocking-tasks",
+				error: error,
+			});
+			new Notice("Failed to toggle blocking tasks");
+		}
+	}
+
+	private arePathArraysEqual(taskNotes: TaskInfo[], previousPaths: string[]): boolean {
+		if (taskNotes.length !== previousPaths.length) return false;
+		for (let i = 0; i < taskNotes.length; i++) {
+			if (taskNotes[i].path !== previousPaths[i]) return false;
+		}
+		return true;
+	}
+
+	private cleanupNonVirtualRendering(): void {
+		this.itemsContainer?.empty();
+		this.currentTaskElements.clear();
+		this.clearClickTimeouts();
+	}
+
+	private destroyVirtualScroller(): void {
+		if (this.virtualScroller) {
+			this.virtualScroller.destroy();
+			this.virtualScroller = null;
+		}
+		this.lastVirtualItems = [];
+	}
+
+	private resetVirtualScrollerIfCardRenderChanged(cardRenderSignature: string): void {
+		if (
+			this.virtualScroller &&
+			this.lastCardRenderSignature !== "" &&
+			this.lastCardRenderSignature !== cardRenderSignature
+		) {
+			this.destroyVirtualScroller();
+		}
+	}
+
+	private buildTaskSignature(task: TaskInfo): string {
+		// Fast signature using only fields that affect rendering
+		return `${task.path}|${task.title}|${task.status}|${task.priority}|${task.due}|${task.scheduled}|${task.recurrence}|${task.archived}|${task.sortOrder}|${task.complete_instances?.join(",")}|${task.reminders?.length}|${task.blocking?.length}|${task.blockedBy?.length}`;
+	}
+
+	private buildCardRenderSignature(
+		visibleProperties: string[] | undefined,
+		cardOptions: TaskCardOptions
+	): string {
+		const propertyLabels = cardOptions.propertyLabels
+			? Object.entries(cardOptions.propertyLabels).sort(([left], [right]) =>
+					left.localeCompare(right)
+				)
+			: [];
+		return JSON.stringify({
+			visibleProperties: visibleProperties ?? null,
+			propertyLabels,
+			expandedRelationshipFilterMode: cardOptions.expandedRelationshipFilterMode ?? null,
+			targetDate: cardOptions.targetDate?.toISOString().slice(0, 10) ?? null,
+		});
+	}
+}
+
+/**
+ * Factory function for Bases registration.
+ * Returns an actual TaskListView instance adapted to the BasesView factory type.
+ */
+export function buildTaskListViewFactory(plugin: TaskNotesPlugin): BasesViewFactory {
+	return function (controller: unknown, containerEl: HTMLElement): BasesView {
+		if (!containerEl) {
+			tasknotesLogger.error("[TaskNotes][TaskListView] No containerEl provided", {
+				category: "stale-data",
+				operation: "no-containerel-provided",
+			});
+			throw new Error("TaskListView requires a containerEl");
+		}
+
+		// Create and return the view instance directly; Bases assigns runtime view fields.
+		return new TaskListView(controller, containerEl, plugin) as unknown as BasesView;
+	};
+}

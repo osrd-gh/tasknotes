@@ -1,0 +1,59 @@
+/*
+ * Relationships Widget
+ *
+ * Styles for the unified relationships widget that displays subtasks, projects,
+ * blocked-by, and blocking relationships in notes via DOM manipulation
+ * in live preview mode. Uses BEM methodology.
+ */
+
+.tasknotes-relationships-widget {
+    display: block;
+    width: auto;
+    margin-block: var(--tn-relationships-widget-margin-top, 1.5em) 2em;
+    margin-inline: var(--file-margins, 0);
+    padding: 1em;
+    border: 1px dashed var(--background-modifier-border-hover);
+    border-radius: var(--radius-s);
+    clear: both;
+    z-index: 10; /* Higher z-index to allow dropdowns to appear above other content */
+
+    /* Allow filter dropdowns to extend beyond widget boundaries */
+    overflow: visible;
+}
+
+.is-readable-line-width .tasknotes-relationships-widget {
+    width: min(100%, var(--file-line-width, 100%));
+    max-width: var(--file-line-width, 100%);
+    margin-inline: auto;
+}
+
+.tasknotes-plugin .relationships__bases-container {
+    width: 100%;
+    min-height: 50px;
+}
+
+.tasknotes-plugin .relationships__error {
+    color: var(--text-error);
+    padding: 1em;
+    text-align: center;
+    font-size: 0.9em;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .tasknotes-plugin .tasknotes-relationships-widget {
+        margin-block: 1em;
+        margin-inline: var(--file-margins, 0);
+        padding: 0.8em;
+    }
+
+    .is-readable-line-width .tasknotes-plugin .tasknotes-relationships-widget {
+        margin-inline: auto;
+    }
+}
+
+/* Dark mode adjustments */
+.theme-dark .tasknotes-plugin .tasknotes-relationships-widget {
+    background-color: var(--background-secondary);
+    border-color: var(--background-modifier-border);
+}

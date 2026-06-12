@@ -1,0 +1,559 @@
+import {
+	App,
+	FuzzySuggestModal,
+	FuzzyMatch,
+	setIcon,
+	Notice,
+	TFile,
+	moment as obsidianMoment,
+} from "obsidian";
+import { TaskInfo } from "../types";
+import TaskNotesPlugin from "../main";
+import { getDatePart } from "../utils/dateUtils";
+import {
+	openMaterializedOccurrenceParent,
+	openOrCreateOccurrenceNote,
+} from "../ui/occurrenceNoteActions";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskActionPaletteModal" });
+
+export interface TaskAction {
+	id: string;
+	title: string;
+	description: string;
+	icon: string;
+	category: "status" | "priority" | "dates" | "tracking" | "organization" | "other";
+	keywords: string[];
+	isApplicable: (task: TaskInfo, plugin: TaskNotesPlugin, targetDate: Date) => boolean;
+	execute: (task: TaskInfo, plugin: TaskNotesPlugin, targetDate: Date) => Promise<void>;
+}
+
+type DateActionProperty = "due" | "scheduled";
+
+interface QuickDatePreset {
+	id: string;
+	label: string;
+	value: string;
+	icon: string;
+	keywords: string[];
+}
+
+type MomentLike = {
+	format(format: string): string;
+	clone(): MomentLike;
+	add(amount: number, unit: string): MomentLike;
+	day(day: number): MomentLike;
+	isBefore(other: MomentLike): boolean;
+	isSame(other: MomentLike, unit: string): boolean;
+	startOf(unit: string): MomentLike;
+};
+
+function getMoment(): MomentLike {
+	return (obsidianMoment as unknown as () => MomentLike)();
+}
+
+export class TaskActionPaletteModal extends FuzzySuggestModal<TaskAction> {
+	private task: TaskInfo;
+	private plugin: TaskNotesPlugin;
+	private targetDate: Date;
+	private actions: TaskAction[];
+
+	constructor(app: App, task: TaskInfo, plugin: TaskNotesPlugin, targetDate: Date) {
+		super(app);
+		this.task = task;
+		this.plugin = plugin;
+		this.targetDate = targetDate;
+		this.actions = this.buildActionsList();
+
+		this.setPlaceholder("Type to search for an action...");
+		this.setInstructions([
+			{ command: "↑↓", purpose: "to navigate" },
+			{ command: "↵", purpose: "to execute" },
+			{ command: "esc", purpose: "to dismiss" },
+		]);
+
+		// Set modal title for accessibility
+		this.titleEl.setText(`Quick actions: ${task.title}`);
+		this.titleEl.setAttribute("id", "task-action-palette-title");
+
+		// Set aria attributes on the modal
+		this.containerEl.setAttribute("aria-labelledby", "task-action-palette-title");
+		this.containerEl.setAttribute("role", "dialog");
+		this.containerEl.setAttribute("aria-modal", "true");
+		this.containerEl.addClass("task-action-palette-modal");
+	}
+
+	private buildActionsList(): TaskAction[] {
+		const actions: TaskAction[] = [];
+
+		// Status actions
+		const availableStatuses = this.task.recurrence
+			? this.plugin.statusManager.getNonCompletionStatuses()
+			: this.plugin.statusManager.getAllStatuses();
+
+		availableStatuses.forEach((statusConfig) => {
+			const isCurrentStatus = this.task.status === statusConfig.value;
+			actions.push({
+				id: `status-${statusConfig.value}`,
+				title: `Change status to "${statusConfig.label}"`,
+				description: `Set task status to ${statusConfig.label}`,
+				icon: isCurrentStatus ? "check" : "circle",
+				category: "status",
+				keywords: ["status", statusConfig.value, statusConfig.label, "change", "set"],
+				isApplicable: () => !isCurrentStatus,
+				execute: async (task) => {
+					await this.plugin.updateTaskProperty(task, "status", statusConfig.value);
+					new Notice(`Status changed to ${statusConfig.label}`);
+				},
+			});
+		});
+
+		// Priority actions
+		this.plugin.priorityManager.getAllPriorities().forEach((priorityConfig) => {
+			const isCurrentPriority = this.task.priority === priorityConfig.value;
+			actions.push({
+				id: `priority-${priorityConfig.value}`,
+				title: `Set priority to "${priorityConfig.label}"`,
+				description: `Change task priority to ${priorityConfig.label}`,
+				icon: isCurrentPriority ? "check" : "flag",
+				category: "priority",
+				keywords: ["priority", priorityConfig.value, priorityConfig.label, "change", "set"],
+				isApplicable: () => !isCurrentPriority,
+				execute: async (task) => {
+					await this.plugin.updateTaskProperty(task, "priority", priorityConfig.value);
+					new Notice(`Priority changed to ${priorityConfig.label}`);
+				},
+			});
+		});
+
+		// Date actions
+		actions.push(
+			{
+				id: "set-due-date",
+				title: "Set due date",
+				description: "Set or change the task due date",
+				icon: "calendar",
+				category: "dates",
+				keywords: ["due", "date", "deadline", "set", "change"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					void this.plugin.openDueDateModal(task);
+				},
+			},
+			{
+				id: "set-scheduled-date",
+				title: "Set scheduled date",
+				description: "Set or change when the task is scheduled",
+				icon: "calendar-clock",
+				category: "dates",
+				keywords: ["scheduled", "date", "schedule", "set", "change"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					void this.plugin.openScheduledDateModal(task);
+				},
+			},
+			{
+				id: "clear-due-date",
+				title: "Clear due date",
+				description: "Remove the due date from this task",
+				icon: "calendar-x",
+				category: "dates",
+				keywords: ["clear", "remove", "due", "date"],
+				isApplicable: (task) => !!task.due,
+				execute: async (task) => {
+					await this.plugin.updateTaskProperty(task, "due", undefined);
+					new Notice("Due date cleared");
+				},
+			},
+			{
+				id: "clear-scheduled-date",
+				title: "Clear scheduled date",
+				description: "Remove the scheduled date from this task",
+				icon: "calendar-x",
+				category: "dates",
+				keywords: ["clear", "remove", "scheduled", "date"],
+				isApplicable: (task) => !!task.scheduled,
+				execute: async (task) => {
+					await this.plugin.updateTaskProperty(task, "scheduled", undefined);
+					new Notice("Scheduled date cleared");
+				},
+			}
+		);
+		this.addQuickDatePresetActions(actions, "scheduled");
+		this.addQuickDatePresetActions(actions, "due");
+
+		// Time tracking actions
+		const activeSession = this.plugin.getActiveTimeSession(this.task);
+		actions.push({
+			id: "toggle-time-tracking",
+			title: activeSession ? "Stop time tracking" : "Start time tracking",
+			description: activeSession
+				? "Stop tracking time for this task"
+				: "Start tracking time for this task",
+			icon: activeSession ? "pause" : "play",
+			category: "tracking",
+			keywords: ["time", "tracking", "timer", activeSession ? "stop" : "start"],
+			isApplicable: () => true,
+			execute: async (task) => {
+				const currentSession = this.plugin.getActiveTimeSession(task);
+				if (currentSession) {
+					await this.plugin.stopTimeTracking(task);
+					new Notice("Time tracking stopped");
+				} else {
+					await this.plugin.startTimeTracking(task);
+					new Notice("Time tracking started");
+				}
+			},
+		});
+
+		// Edit time entries action (only show if task has time entries)
+		if (this.task.timeEntries && this.task.timeEntries.length > 0) {
+			actions.push({
+				id: "edit-time-entries",
+				title: "Edit time entries",
+				description: "View, edit, or add time entries for this task",
+				icon: "clock",
+				category: "tracking",
+				keywords: ["time", "entries", "edit", "tracking", "history"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					this.plugin.openTimeEntryEditor(task);
+					this.close();
+				},
+			});
+		}
+
+		// Organization actions
+		actions.push({
+			id: "toggle-archive",
+			title: this.task.archived ? "Unarchive task" : "Archive task",
+			description: this.task.archived
+				? "Move task back to active tasks"
+				: "Archive this task",
+			icon: this.task.archived ? "archive-restore" : "archive",
+			category: "organization",
+			keywords: ["archive", this.task.archived ? "unarchive" : "archive", "organize"],
+			isApplicable: () => true,
+			execute: async (task) => {
+				await this.plugin.toggleTaskArchive(task);
+				new Notice(task.archived ? "Task unarchived" : "Task archived");
+			},
+		});
+
+		// Recurring task actions (only for recurring tasks)
+		if (this.task.recurrence) {
+			actions.push({
+				id: "complete-recurring-instance",
+				title: "Complete this occurrence",
+				description: "Mark this specific instance of the recurring task as complete",
+				icon: "check-circle",
+				category: "dates",
+				keywords: ["complete", "done", "finish", "recurring", "instance", "occurrence"],
+				isApplicable: (task, plugin, targetDate) => {
+					return !plugin.statusManager.isCompletedStatus(task.status);
+				},
+				execute: async (task, plugin, targetDate) => {
+					await plugin.toggleRecurringTaskComplete(task, targetDate);
+					new Notice("Recurring task instance completed");
+				},
+			});
+
+			actions.push({
+				id: "open-or-create-occurrence-note",
+				title: "Open or create occurrence note",
+				description: "Open the note for this occurrence, creating it if needed",
+				icon: "file-plus",
+				category: "dates",
+				keywords: [
+					"open",
+					"create",
+					"materialize",
+					"note",
+					"recurring",
+					"instance",
+					"occurrence",
+				],
+				isApplicable: () => true,
+				execute: async (task, plugin, targetDate) => {
+					await openOrCreateOccurrenceNote({
+						plugin,
+						parentTask: task,
+						targetDate,
+						openInNewLeaf: true,
+					});
+				},
+			});
+		}
+
+		if (this.task.recurrence_parent && this.task.occurrence_date) {
+			actions.push({
+				id: "open-recurring-parent",
+				title: "Open recurring parent",
+				description: "Open the recurring task that generated this occurrence",
+				icon: "refresh-ccw",
+				category: "other",
+				keywords: ["open", "parent", "recurring", "materialized", "occurrence"],
+				isApplicable: () => true,
+				execute: async (task, plugin) => {
+					await openMaterializedOccurrenceParent({
+						plugin,
+						occurrenceTask: task,
+						openInNewLeaf: true,
+					});
+				},
+			});
+		}
+
+		// Other actions
+		actions.push(
+			{
+				id: "edit-task",
+				title: "Edit task details",
+				description: "Open the full task editor",
+				icon: "edit",
+				category: "other",
+				keywords: ["edit", "modify", "details", "properties"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					await this.plugin.openTaskEditModal(task);
+				},
+			},
+			{
+				id: "open-task-file",
+				title: "Open task file",
+				description: "Open the task file in the editor",
+				icon: "file-text",
+				category: "other",
+				keywords: ["open", "file", "editor", "edit"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					const file = this.plugin.app.vault.getAbstractFileByPath(task.path);
+					if (file instanceof TFile) {
+						await this.plugin.app.workspace.getLeaf(true).openFile(file);
+					}
+				},
+			},
+			{
+				id: "copy-task-title",
+				title: "Copy task title",
+				description: "Copy the task title to clipboard",
+				icon: "copy",
+				category: "other",
+				keywords: ["copy", "clipboard", "title"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					try {
+						await navigator.clipboard.writeText(task.title);
+						new Notice("Task title copied to clipboard");
+					} catch {
+						new Notice("Failed to copy to clipboard");
+					}
+				},
+			},
+			{
+				id: "copy-task-link",
+				title: "Copy task link",
+				description: "Copy a wikilink to this task",
+				icon: "link",
+				category: "other",
+				keywords: ["copy", "link", "wikilink", "reference"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					try {
+						const file = this.plugin.app.vault.getAbstractFileByPath(task.path);
+						if (file instanceof TFile) {
+							const linkText = this.plugin.app.metadataCache.fileToLinktext(file, "");
+							await navigator.clipboard.writeText(`[[${linkText}]]`);
+							new Notice("Task link copied to clipboard");
+						}
+					} catch {
+						new Notice("Failed to copy to clipboard");
+					}
+				},
+			},
+			{
+				id: "delete-task",
+				title: "Delete task",
+				description: "Permanently delete this task",
+				icon: "trash",
+				category: "other",
+				keywords: ["delete", "remove", "trash"],
+				isApplicable: () => true,
+				execute: async (task) => {
+					// Close the action palette first
+					this.close();
+
+					// Show confirmation and delete if confirmed
+					const { showDeleteConfirmationModal } = await import("../ui/TaskCard");
+					await showDeleteConfirmationModal(task, this.plugin);
+				},
+			}
+		);
+
+		return actions;
+	}
+
+	private getQuickDatePresets(): QuickDatePreset[] {
+		const today = getMoment();
+		const nextSaturday = today.clone().day(6);
+		if (nextSaturday.isBefore(today) || nextSaturday.isSame(today, "day")) {
+			nextSaturday.add(1, "week");
+		}
+
+		return [
+			{
+				id: "today",
+				label: "today",
+				value: today.format("YYYY-MM-DD"),
+				icon: "calendar-check",
+				keywords: ["today"],
+			},
+			{
+				id: "tomorrow",
+				label: "tomorrow",
+				value: today.clone().add(1, "day").format("YYYY-MM-DD"),
+				icon: "calendar-plus",
+				keywords: ["tomorrow"],
+			},
+			{
+				id: "this-weekend",
+				label: "this weekend",
+				value: nextSaturday.format("YYYY-MM-DD"),
+				icon: "calendar-days",
+				keywords: ["weekend", "saturday"],
+			},
+			{
+				id: "next-week",
+				label: "next week",
+				value: today.clone().day(1).add(1, "week").format("YYYY-MM-DD"),
+				icon: "calendar-plus",
+				keywords: ["next", "week", "monday"],
+			},
+			{
+				id: "next-month",
+				label: "next month",
+				value: today.clone().add(1, "month").startOf("month").format("YYYY-MM-DD"),
+				icon: "calendar-range",
+				keywords: ["next", "month"],
+			},
+		];
+	}
+
+	private addQuickDatePresetActions(actions: TaskAction[], property: DateActionProperty): void {
+		const propertyLabel = property === "scheduled" ? "scheduled date" : "due date";
+		const noticeLabel = property === "scheduled" ? "Scheduled date" : "Due date";
+		const verb = property === "scheduled" ? "Schedule" : "Set due";
+
+		this.getQuickDatePresets().forEach((preset) => {
+			actions.push({
+				id: `set-${property}-${preset.id}`,
+				title: `${verb} for ${preset.label}`,
+				description: `Set the task ${propertyLabel} to ${preset.label}`,
+				icon: preset.icon,
+				category: "dates",
+				keywords: [property, "date", "set", "change", ...preset.keywords],
+				isApplicable: (task) => {
+					const currentDate = task[property] ? getDatePart(task[property]) : undefined;
+					return currentDate !== preset.value;
+				},
+				execute: async (task) => {
+					await this.plugin.updateTaskProperty(task, property, preset.value);
+					new Notice(`${noticeLabel} set`);
+				},
+			});
+		});
+	}
+
+	getItems(): TaskAction[] {
+		// Filter to only applicable actions and sort by category and title
+		return this.actions
+			.filter((action) => action.isApplicable(this.task, this.plugin, this.targetDate))
+			.sort((a, b) => {
+				// Sort by category first
+				const categoryOrder = {
+					status: 0,
+					priority: 1,
+					dates: 2,
+					tracking: 3,
+					organization: 4,
+					other: 5,
+				};
+
+				const categoryA = categoryOrder[a.category] ?? 999;
+				const categoryB = categoryOrder[b.category] ?? 999;
+
+				if (categoryA !== categoryB) {
+					return categoryA - categoryB;
+				}
+
+				// Then by title
+				return a.title.localeCompare(b.title);
+			});
+	}
+
+	getItemText(action: TaskAction): string {
+		// Include title, description, and keywords in searchable text
+		return [action.title, action.description, action.category, ...action.keywords].join(" ");
+	}
+
+	renderSuggestion(item: FuzzyMatch<TaskAction>, el: HTMLElement) {
+		const action = item.item;
+		const container = el.createDiv({ cls: "task-action-palette__suggestion" });
+
+		// Icon
+		const iconEl = container.createDiv({ cls: "task-action-palette__icon" });
+		setIcon(iconEl, action.icon);
+
+		// Content
+		const contentEl = container.createDiv({ cls: "task-action-palette__content" });
+
+		// Title
+		contentEl.createDiv({
+			cls: "task-action-palette__title",
+			text: action.title,
+		});
+
+		// Description
+		contentEl.createDiv({
+			cls: "task-action-palette__description",
+			text: action.description,
+		});
+
+		// Category badge
+		const badgeEl = container.createDiv({ cls: "task-action-palette__badge" });
+		badgeEl.createSpan({
+			cls: `task-action-palette__category task-action-palette__category--${action.category}`,
+			text: action.category,
+		});
+	}
+
+	onChooseItem(action: TaskAction, evt: MouseEvent | KeyboardEvent): void {
+		void this.executeAction(action, evt);
+	}
+
+	private async executeAction(
+		action: TaskAction,
+		evt: MouseEvent | KeyboardEvent
+	): Promise<void> {
+		try {
+			// Refresh task data to ensure we have the latest information
+			const freshTask = await this.plugin.cacheManager.getTaskInfo(this.task.path);
+			if (!freshTask) {
+				new Notice("Task not found");
+				return;
+			}
+
+			await action.execute(freshTask, this.plugin, this.targetDate);
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			tasknotesLogger.error("Error executing action:", {
+				category: "persistence",
+				operation: "executing-action",
+				details: { actionId: action.id, taskPath: this.task.path },
+				error: errorMessage,
+			});
+			new Notice(`Failed to execute action: ${errorMessage}`);
+		}
+	}
+}

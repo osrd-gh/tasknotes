@@ -1,0 +1,274 @@
+import { TaskInfo, TimeEntry } from "../types";
+import TaskNotesPlugin from "../main";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/ViewOptimizations" });
+
+export interface ViewPerformanceConfig {
+	viewId: string;
+	debounceDelay?: number;
+	maxBatchSize?: number;
+	changeDetectionEnabled?: boolean;
+}
+
+export interface ViewUpdateHandler {
+	updateForTask: (taskPath: string, operation: "update" | "delete" | "create") => Promise<void>;
+	refresh: (force?: boolean) => Promise<void>;
+	shouldRefreshForTask?: (originalTask: TaskInfo | undefined, updatedTask: TaskInfo) => boolean;
+}
+
+interface ViewPerformanceRegistry {
+	registerView(config: ViewPerformanceConfig, handler: ViewUpdateHandler): void;
+	unregisterView(viewId: string): void;
+}
+
+/**
+ * Mixin interface for views that want performance optimizations
+ */
+export interface OptimizedView {
+	plugin: TaskNotesPlugin;
+	viewPerformanceService?: ViewPerformanceRegistry;
+	performanceConfig?: ViewPerformanceConfig;
+	getViewType(): string;
+
+	// Methods that implementing views should provide
+	updateForTask(taskPath: string, operation: "update" | "delete" | "create"): Promise<void>;
+	refresh(force?: boolean): Promise<void>;
+	shouldRefreshForTask?(originalTask: TaskInfo | undefined, updatedTask: TaskInfo): boolean;
+}
+
+/**
+ * Initialize performance optimizations for a view
+ */
+export function initializeViewPerformance(
+	view: OptimizedView,
+	config: Partial<ViewPerformanceConfig>
+): void {
+	const fullConfig: ViewPerformanceConfig = {
+		viewId: view.getViewType(),
+		debounceDelay: 100,
+		maxBatchSize: 5,
+		changeDetectionEnabled: true,
+		...config,
+	};
+
+	view.performanceConfig = fullConfig;
+	view.viewPerformanceService = view.plugin.viewPerformanceService;
+
+	if (view.viewPerformanceService) {
+		const handler: ViewUpdateHandler = {
+			updateForTask: view.updateForTask.bind(view),
+			refresh: view.refresh.bind(view),
+			shouldRefreshForTask: view.shouldRefreshForTask?.bind(view),
+		};
+
+		view.viewPerformanceService.registerView(fullConfig, handler);
+	} else {
+		tasknotesLogger.warn(
+			`[ViewOptimizations] ViewPerformanceService not available for ${fullConfig.viewId}`,
+			{ category: "stale-data", operation: "viewperformanceservice-not" }
+		);
+	}
+}
+
+/**
+ * Cleanup performance optimizations when view is closed
+ */
+export function cleanupViewPerformance(view: OptimizedView): void {
+	if (view.viewPerformanceService && view.performanceConfig) {
+		view.viewPerformanceService.unregisterView(view.performanceConfig.viewId);
+	}
+}
+
+/**
+ * Helper for views that want to determine if they should refresh for a task update
+ */
+export function shouldRefreshForDateBasedView(
+	originalTask: TaskInfo | undefined,
+	updatedTask: TaskInfo
+): boolean {
+	if (!originalTask) return true;
+
+	// For date-based views (calendars, agendas), check if date-related fields or visual properties changed
+	const timeEntriesChanged = !areTimeEntriesEqual(
+		originalTask.timeEntries,
+		updatedTask.timeEntries
+	);
+	return (
+		originalTask.due !== updatedTask.due ||
+		originalTask.scheduled !== updatedTask.scheduled ||
+		originalTask.status !== updatedTask.status ||
+		originalTask.completedDate !== updatedTask.completedDate ||
+		originalTask.recurrence !== updatedTask.recurrence ||
+		originalTask.priority !== updatedTask.priority || // Priority affects event visual appearance
+		originalTask.title !== updatedTask.title || // Title changes should be reflected
+		originalTask.archived !== updatedTask.archived || // Archived tasks should disappear from date-based views
+		originalTask.path !== updatedTask.path || // Path changes indicate the file moved and need re-render
+		originalTask.timeEstimate !== updatedTask.timeEstimate || // Duration changes affect multi-day rendering
+		originalTask.totalTrackedTime !== updatedTask.totalTrackedTime || // Time tracking summary changes event info
+		timeEntriesChanged
+	); // Time entry adjustments affect rendered segments
+}
+
+/**
+ * Helper for views that want to determine if they should refresh for task properties
+ */
+export function shouldRefreshForPropertyBasedView(
+	originalTask: TaskInfo | undefined,
+	updatedTask: TaskInfo,
+	watchedProperties: (keyof TaskInfo)[]
+): boolean {
+	if (!originalTask) return true;
+
+	// Check if any of the watched properties changed
+	return watchedProperties.some((prop) => originalTask[prop] !== updatedTask[prop]);
+}
+
+/**
+ * Generic selective update implementation for list-based views
+ * This can be used by TaskListView, KanbanView, etc.
+ */
+export async function selectiveUpdateForListView(
+	view: {
+		taskElements?: Map<string, HTMLElement>;
+		plugin: TaskNotesPlugin;
+		getCurrentVisibleProperties?: () => string[];
+		getVisibleProperties?: () => string[];
+		getVisiblePropertyLabels?: () => Record<string, string>;
+		refresh?: () => void | Promise<void>;
+	},
+	taskPath: string,
+	operation: "update" | "delete" | "create"
+): Promise<void> {
+	if (!view.taskElements) {
+		// Fallback to full refresh if view doesn't have taskElements tracking
+		await view.refresh?.();
+		return;
+	}
+
+	const taskElement = view.taskElements.get(taskPath);
+
+	switch (operation) {
+		case "update":
+			if (taskElement) {
+				// Task is visible - update it in place
+				const updatedTask = await view.plugin.cacheManager.getTaskInfo(taskPath);
+				if (updatedTask) {
+					// Get visible properties from the view instead of extracting from DOM
+					const visibleProperties = view.getCurrentVisibleProperties?.() ||
+						view.getVisibleProperties?.() || [
+							"due",
+							"scheduled",
+							"projects",
+							"contexts",
+							"tags",
+						];
+					const propertyLabels = view.getVisiblePropertyLabels?.();
+					await updateTaskElementInPlace(
+						taskElement,
+						updatedTask,
+						view.plugin,
+						visibleProperties,
+						propertyLabels
+					);
+				} else {
+					// Task was deleted, remove from view
+					taskElement.remove();
+					view.taskElements.delete(taskPath);
+				}
+			}
+			// If task not visible, no action needed
+			break;
+
+		case "delete":
+			if (taskElement) {
+				taskElement.remove();
+				view.taskElements.delete(taskPath);
+			}
+			break;
+
+		case "create":
+			// For new tasks, we generally need to check if they should be visible
+			// This is view-specific, so fallback to refresh for now
+			await view.refresh?.();
+			break;
+	}
+}
+
+/**
+ * Update a task element in place using TaskCard functionality
+ */
+async function updateTaskElementInPlace(
+	element: HTMLElement,
+	taskInfo: TaskInfo,
+	plugin: TaskNotesPlugin,
+	visibleProperties: string[],
+	propertyLabels?: Record<string, string>
+): Promise<void> {
+	try {
+		// Use the existing updateTaskCard function if available
+		const { updateTaskCard } = await import("../ui/TaskCard");
+
+		updateTaskCard(element, taskInfo, plugin, visibleProperties, { propertyLabels });
+
+		// Add update animation
+		element.classList.add("task-card--updated");
+		window.setTimeout(() => {
+			element.classList.remove("task-card--updated");
+		}, 1000);
+	} catch (error) {
+		tasknotesLogger.error("[ViewOptimizations] Error updating task element in place:", {
+			category: "persistence",
+			operation: "updating-task-element-place",
+			error: error,
+		});
+		// Could fallback to full refresh here if needed
+	}
+}
+
+/**
+ * Performance monitoring utility for debugging
+ */
+export class ViewPerformanceMonitor {
+	private startTimes = new Map<string, number>();
+
+	startTimer(operation: string): void {
+		this.startTimes.set(operation, performance.now());
+	}
+
+	endTimer(operation: string, logThreshold = 100): number {
+		const startTime = this.startTimes.get(operation);
+		if (!startTime) return 0;
+
+		const elapsed = performance.now() - startTime;
+		this.startTimes.delete(operation);
+
+		return elapsed;
+	}
+
+	measureAsync<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+		this.startTimer(operation);
+		return fn().finally(() => this.endTimer(operation));
+	}
+}
+
+function areTimeEntriesEqual(a?: TimeEntry[], b?: TimeEntry[]): boolean {
+	if (a === b) return true;
+	if (!a || !b) return a === b;
+	if (a.length !== b.length) return false;
+
+	for (let i = 0; i < a.length; i++) {
+		const entryA = a[i];
+		const entryB = b[i];
+		if (
+			entryA.startTime !== entryB.startTime ||
+			entryA.endTime !== entryB.endTime ||
+			entryA.description !== entryB.description ||
+			entryA.duration !== entryB.duration
+		) {
+			return false;
+		}
+	}
+
+	return true;
+}
